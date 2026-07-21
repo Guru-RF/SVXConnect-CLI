@@ -13,6 +13,8 @@
 #include "headless.h"
 #include "reflector/enroll.h"
 #include "audio/audiotest.h"
+#include "app.h"
+#include "ui/ui.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -209,8 +211,12 @@ int main(int argc, char **argv) {
                     "https://github.com/Guru-RF/SVXConnect-CLI/blob/main/example.conf");
             return 1;
         }
-        fprintf(stderr, "svxconnect: the interface is not implemented yet "
-                        "(milestone M7). Use --headless for now.\n");
-        return 69;
+        {
+            svx_app *app = app_new(&cfg, no_tx);
+            if (!app) { fprintf(stderr, "svxconnect: out of memory\n"); return 1; }
+            int rc = ui_run(app);
+            app_free(app);
+            return rc;
+        }
     }
 }

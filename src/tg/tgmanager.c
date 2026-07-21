@@ -330,6 +330,13 @@ void tgm_tick(tg_manager *m, uint64_t now) {
 void tgm_select(tg_manager *m, uint32_t tg) {
     if (tg == m->selected) return;
 
+    /* Log every manual change, and say so loudly when it deselects entirely.
+     * Dropping to monitor-only means you silently stop being on a talkgroup,
+     * which looks identical to a bug if it was not deliberate — so leave a
+     * trace naming this path, distinct from the idle timeout's own message. */
+    if (tg == 0) log_info("deselected TG %u — monitoring only", m->selected);
+    else         log_info("TG %u", tg);
+
     m->selected       = tg;
     m->preempted_from = 0;
     /* Arm the linger window on a manual choice too, or a busy high-priority
