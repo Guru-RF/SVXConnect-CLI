@@ -10,6 +10,7 @@
 #include "common/config.h"
 #include "common/log.h"
 #include "common/util.h"
+#include "headless.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -188,6 +189,14 @@ int main(int argc, char **argv) {
         return 69;
 
     case MODE_HEADLESS:
+        if (config_validate(&cfg, 0) != 0) {
+            fprintf(stderr, "\nsvxconnect: fix the configuration and try again.\n"
+                            "            Start from the example: %s\n",
+                    "https://github.com/Guru-RF/SVXConnect-CLI/blob/main/example.conf");
+            return 1;
+        }
+        return run_headless(&cfg, no_tx);
+
     case MODE_TUI:
     default:
         if (config_validate(&cfg, 0) != 0) {
@@ -196,9 +205,8 @@ int main(int argc, char **argv) {
                     "https://github.com/Guru-RF/SVXConnect-CLI/blob/main/example.conf");
             return 1;
         }
-        (void)no_tx;
-        fprintf(stderr, "svxconnect: the reflector client is not implemented yet "
-                        "(milestone M1)\n");
+        fprintf(stderr, "svxconnect: the interface is not implemented yet "
+                        "(milestone M7). Use --headless for now.\n");
         return 69;
     }
 }

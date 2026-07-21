@@ -12,9 +12,13 @@ CC       ?= cc
 # gnu11 (not c11): on glibc, strict -std=c11 sets __STRICT_ANSI__ and hides BSD/
 # POSIX declarations (clock_gettime, getaddrinfo, strncasecmp, ns_*, ...).
 CFLAGS   ?= -O2 -g -Wall -Wextra -Wno-unused-parameter -std=gnu11
-CFLAGS   += -Isrc -Ithird_party
 CPPFLAGS ?=
 LDFLAGS  ?=
+
+# `override`, because a variable set on the command line (make CFLAGS="-fsanitize=...")
+# otherwise beats every assignment in this file, including `+=` — which would
+# silently drop the include path and break the build in a confusing way.
+override CFLAGS += -Isrc -Ithird_party
 
 BUILD  := build
 PREFIX ?= /usr/local
