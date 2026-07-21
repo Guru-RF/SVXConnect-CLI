@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Embedded into the Mach-O __TEXT,__info_plist section by the Makefile, so
+     that macOS has a bundle identifier and a microphone usage string for a
+     binary that is not inside an .app bundle. See docs/TCC.md. -->
+<plist version="1.0">
+<dict>
+    <key>CFBundleIdentifier</key>
+    <string>rf.guru.svxconnect</string>
+    <key>CFBundleName</key>
+    <string>SVXConnect</string>
+    <key>CFBundleDisplayName</key>
+    <string>SVXConnect</string>
+    <key>CFBundleExecutable</key>
+    <string>svxconnect</string>
+    <key>CFBundleShortVersionString</key>
+    <string>0.1.0</string>
+    <key>CFBundleVersion</key>
+    <string>0.1.0</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>SVXConnect transmits your voice to the SvxLink reflector when you press the transmit key.</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>11.0</string>
+</dict>
+</plist>

@@ -1,0 +1,55 @@
+SVXConnect-CLI — third-party components
+=======================================
+
+SVXConnect-CLI itself is licensed GPL-3.0-or-later (see LICENSE).
+It links against, or vendors, the following third-party components. All are
+GPL-3.0 compatible.
+
+
+libopus
+-------
+Opus audio codec. Copyright (c) 2001-2023 Xiph.Org, Skype Limited, Octasic,
+Jean-Marc Valin, Timothy B. Terriberry, CSIRO, Gregory Maxwell, Mark Borgerding,
+Erik de Castro Lopo.
+Licensed under the 3-clause BSD license. https://opus-codec.org/
+
+
+OpenSSL 3
+---------
+Copyright (c) 1998-2024 The OpenSSL Project Authors.
+Licensed under the Apache License 2.0, which is compatible with GPL-3.0.
+Section 4 of Apache-2.0 requires the NOTICE file to be retained in binary
+distributions. https://www.openssl.org/
+
+
+ncurses
+-------
+Copyright (c) 1998-2024 Free Software Foundation, Inc.
+Licensed under the X11-style ncurses license (MIT-like, GPL compatible).
+https://invisible-island.net/ncurses/
+
+
+miniaudio (vendored: third_party/miniaudio.h)
+---------------------------------------------
+Copyright (c) 2025 David Reid.
+Dual licensed: public domain (Unlicense) OR MIT-0, at your option.
+SVXConnect-CLI takes it under MIT-0. https://miniaud.io/
+
+miniaudio dlopen()s the system audio client libraries at runtime rather than
+linking them:
+  - alsa-lib   (LGPL-2.1-or-later) — runtime dlopen of libasound.so.2
+  - libpulse   (LGPL-2.1-or-later) — runtime dlopen of libpulse.so.0
+Neither is a build dependency and neither is distributed with this project.
+
+
+Code provenance
+---------------
+The SvxLink reflector v3 protocol, TLS, AES-GCM and Opus layers are derived
+from the author's own prior C work in the SvxBridge project, relicensed here
+under GPL-3.0-or-later by the copyright holder (Joeri Van Dooren).
+
+Protocol message numbers and field layouts are transcribed from the author's
+own SVXConnect-OSX implementation. No code from the upstream SvxLink project
+(GPL-2.0) has been copied, and none of SvxBridge's GPL-2.0-derived DMR,
+D-STAR, DCS or AMBE modules are used here — a reflector client needs none of
+them.

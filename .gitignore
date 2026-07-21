@@ -1,0 +1,14 @@
+build/
+*.o
+*.d
+
+# Local config and PKI material — never commit these.
+svxconnect.conf
+*.key
+*.crt
+*.csr
+*.pem
+pki/
+
+# macOS
+.DS_Store
