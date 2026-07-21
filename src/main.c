@@ -93,9 +93,9 @@ static void usage(FILE *f) {
 "  -h, --help            this help\n"
 "\n"
 "Keys (in the TUI):\n"
-"  left/right  switch talkgroup      up     lock/unlock talkgroup\n"
-"  space       transmit (toggle)     ESC    stop transmitting\n"
-"  m mute   d devices   l log   r reconnect   ? help   q quit\n"
+"  up/down     switch talkgroup      PageDown  lock/unlock talkgroup\n"
+"  left/right  output volume         space     transmit (toggle)\n"
+"  ESC stop tx   m mute   d devices   l log   r reconnect   ? help   q quit\n"
 "\n"
 "Report bugs at https://github.com/Guru-RF/SVXConnect-CLI\n");
 }

@@ -110,16 +110,16 @@ idle_seconds   = 60    # silence everywhere this long -> drop to monitor-only
 ```
 
 A talker on a higher-priority talkgroup pulls you over automatically. Priority 0
-never interrupts a talkgroup that is already busy. Press ↑ to lock and stop all
-automatic switching.
+never interrupts a talkgroup that is already busy. Press PageDown to lock and
+stop all automatic switching.
 
 ## Keys
 
 | Key | Action |
 |---|---|
-| `←` `→` | previous / next switchable talkgroup |
-| `↑` | lock / unlock the talkgroup (no automatic switching) |
-| `↓` | monitor only (deselect) |
+| `↑` `↓` | previous / next switchable talkgroup |
+| `←` `→` | output volume down / up |
+| `PageDown` | lock / unlock the talkgroup (no automatic switching) |
 | `SPACE` | transmit — **toggle**: press to start, press again to stop |
 | `ESC` | stop transmitting immediately |
 | `1`–`9` | jump to the Nth switchable talkgroup |

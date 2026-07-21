@@ -53,7 +53,7 @@ enum {
     G_HL, G_VL, G_TL, G_TR, G_BL, G_BR,
     G_TD, G_TU, G_TE_L, G_TE_R,
     G_BLOCK, G_SHADE, G_EDGE, G_DOT,
-    G_LARR, G_RARR, G_UARR,
+    G_LARR, G_RARR, G_UARR, G_DARR,
     G_N
 };
 
@@ -64,11 +64,11 @@ static const char *const GLYPHS[2][G_N] = {
     { "-", "|", "+", "+", "+", "+",
       "+", "+", "+", "+",
       "#", ".", "|", "*",
-      "<", ">", "^" },
+      "<", ">", "^", "v" },
     { "─", "│", "┌", "┐", "└", "┘",
       "┬", "┴", "┤", "├",
       "█", "░", "▌", "●",
-      "←", "→", "↑" }
+      "←", "→", "↑", "↓" }
 };
 
 /* ------------------------------------------------------------------ colours */
@@ -695,13 +695,13 @@ static void draw_keys(const ui_state *st) {
      * a hint that is cut off mid-word is worse than a shorter hint. */
     if (st->lay.cols >= 92)
         snprintf(buf, sizeof(buf),
-                 "%s/%s tg  %s lock  SPACE ptt  m mute  Enter goto  d dev  l log  "
-                 "r reconn  ? help  q quit",
-                 st->g[G_LARR], st->g[G_RARR], st->g[G_UARR]);
+                 "%s/%s tg  %s/%s vol  PgDn lock  SPACE ptt  m mute  Enter goto  "
+                 "d dev  l log  r reconn  ? help  q quit",
+                 st->g[G_UARR], st->g[G_DARR], st->g[G_LARR], st->g[G_RARR]);
     else
         snprintf(buf, sizeof(buf),
-                 "%s/%s tg  %s lock  SPACE ptt  m mute  d dev  l log  ? help  q quit",
-                 st->g[G_LARR], st->g[G_RARR], st->g[G_UARR]);
+                 "%s/%s tg  %s/%s vol  PgDn lock  SPACE ptt  m mute  d dev  ? help  q quit",
+                 st->g[G_UARR], st->g[G_DARR], st->g[G_LARR], st->g[G_RARR]);
 
     put_attr(st, st->lay.keys_y, 2, st->lay.cols - 3, A_DIM, buf);
 }
@@ -727,9 +727,9 @@ static void draw_box(const ui_state *st, int y0, int x0, int h, int w, const cha
 
 static void draw_help(const ui_state *st) {
     static const char *const LINES[] = {
-        "left / right   previous / next talkgroup",
-        "up             lock the talkgroup (nothing may move you)",
-        "down           monitor only, no talkgroup selected",
+        "up / down      previous / next talkgroup",
+        "left / right   output volume down / up",
+        "PageDown       lock the talkgroup (nothing may move you)",
         "1 .. 9         jump to the n-th configured talkgroup",
         "SPACE          transmit (toggle; a terminal has no key-up)",
         "ESC            stop transmitting, close this window",
@@ -971,10 +971,11 @@ static void handle_key(ui_state *st, int ch) {
     if (modal_key(st, ch)) return;
 
     switch (ch) {
-    case KEY_LEFT:   app_tg_prev(st->app); break;
-    case KEY_RIGHT:  app_tg_next(st->app); break;
-    case KEY_UP:     app_toggle_lock(st->app); break;
-    case KEY_DOWN:   app_tg_select(st->app, 0); break;
+    case KEY_UP:     app_tg_prev(st->app); break;         /* previous talkgroup */
+    case KEY_DOWN:   app_tg_next(st->app); break;         /* next talkgroup     */
+    case KEY_LEFT:   app_volume_delta(st->app, -5); break;/* quieter            */
+    case KEY_RIGHT:  app_volume_delta(st->app,  5); break;/* louder             */
+    case KEY_NPAGE:  app_toggle_lock(st->app); break;     /* PageDown: lock     */
 
     case ' ':        app_ptt(st->app, CTL_TOGGLE); break;
     case 27:         app_ptt(st->app, CTL_OFF); break;
