@@ -474,6 +474,16 @@ static void draw_tg_pane(ui_state *st, uint64_t now) {
 
     draw_tg_header(st, now);
 
+    /* While the talkgroup list is focused, up/down switch talkgroup rather than
+     * moving an independent cursor, so keep the reverse-highlight on the
+     * selected row — otherwise the '>' marker and the highlight would drift
+     * apart. Whatever changed the selection (arrows, digits, preemption, the
+     * FIFO), the highlight follows it. */
+    if (st->focus == FOCUS_TG) {
+        for (int i = 0; i < st->n_tg; i++)
+            if (st->tg[i].tg == sel) { st->cur[FOCUS_TG] = i; break; }
+    }
+
     int y     = L->tg_top + 2;
     int x_age = x0 + w - 5;
     int x_pri = x0 + 8;
@@ -727,15 +737,14 @@ static void draw_box(const ui_state *st, int y0, int x0, int h, int w, const cha
 
 static void draw_help(const ui_state *st) {
     static const char *const LINES[] = {
-        "up / down      previous / next talkgroup",
+        "up / down      talkgroup up / down, or move the cursor in a pane",
         "left / right   output volume down / up",
         "PageDown       lock the talkgroup (nothing may move you)",
         "1 .. 9         jump to the n-th configured talkgroup",
         "SPACE          transmit (toggle; a terminal has no key-up)",
         "ESC            stop transmitting, close this window",
-        "Tab / S-Tab    move between the talkgroup, active and recent panes",
-        "j / k          move the cursor inside the focused pane",
-        "Enter          go to the talkgroup under the cursor",
+        "Tab / S-Tab    focus the talkgroup, active or recent pane",
+        "Enter          go to the talkgroup or talker under the cursor",
         "m              mute / unmute the talkgroup under the cursor",
         "+ / -          output volume        0   mute the speaker",
         "t              test tone            s   sort numeric / last heard",
@@ -863,6 +872,19 @@ static void cursor_step(ui_state *st, int delta) {
     st->cur[st->focus] = CLAMP(st->cur[st->focus] + delta, 0, n - 1);
 }
 
+/* Up/down do the natural thing for whatever pane has focus: on the talkgroup
+ * list (the default) they switch talkgroup; once you Tab into the ACTIVE or
+ * RECENT pane they move that pane's row cursor, so you can pick a talker and
+ * press Enter to jump to them — no separate j/k needed. */
+static void nav_up(ui_state *st) {
+    if (st->focus == FOCUS_TG) app_tg_prev(st->app);
+    else                       cursor_step(st, -1);
+}
+static void nav_down(ui_state *st) {
+    if (st->focus == FOCUS_TG) app_tg_next(st->app);
+    else                       cursor_step(st, 1);
+}
+
 static void focus_step(ui_state *st, int delta) {
     st->focus = (ui_focus)(((int)st->focus + delta + FOCUS_N) % FOCUS_N);
     clamp_cursor(st);
@@ -971,19 +993,17 @@ static void handle_key(ui_state *st, int ch) {
     if (modal_key(st, ch)) return;
 
     switch (ch) {
-    case KEY_UP:     app_tg_prev(st->app); break;         /* previous talkgroup */
-    case KEY_DOWN:   app_tg_next(st->app); break;         /* next talkgroup     */
-    case KEY_LEFT:   app_volume_delta(st->app, -5); break;/* quieter            */
-    case KEY_RIGHT:  app_volume_delta(st->app,  5); break;/* louder             */
-    case KEY_NPAGE:  app_toggle_lock(st->app); break;     /* PageDown: lock     */
+    case KEY_UP:   case 'k': nav_up(st);   break;         /* TG up / cursor up   */
+    case KEY_DOWN: case 'j': nav_down(st); break;         /* TG down / cursor dn */
+    case KEY_LEFT:   app_volume_delta(st->app, -5); break;/* quieter             */
+    case KEY_RIGHT:  app_volume_delta(st->app,  5); break;/* louder              */
+    case KEY_NPAGE:  app_toggle_lock(st->app); break;     /* PageDown: lock      */
 
     case ' ':        app_ptt(st->app, CTL_TOGGLE); break;
     case 27:         app_ptt(st->app, CTL_OFF); break;
 
     case '\t':       focus_step(st, 1); break;
     case KEY_BTAB:   focus_step(st, -1); break;
-    case 'j':        cursor_step(st, 1); break;
-    case 'k':        cursor_step(st, -1); break;
 
     case '\r': case '\n': case KEY_ENTER: activate_row(st); break;
 

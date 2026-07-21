@@ -117,12 +117,13 @@ stop all automatic switching.
 
 | Key | Action |
 |---|---|
-| `↑` `↓` | previous / next switchable talkgroup |
+| `↑` `↓` | previous / next talkgroup — or move the cursor in a focused pane |
 | `←` `→` | output volume down / up |
 | `PageDown` | lock / unlock the talkgroup (no automatic switching) |
 | `SPACE` | transmit — **toggle**: press to start, press again to stop |
 | `ESC` | stop transmitting immediately |
 | `1`–`9` | jump to the Nth switchable talkgroup |
+| `Tab` `⇧Tab` | focus the talkgroup, active or recent pane |
 | `Enter` | switch to the highlighted talkgroup or talker |
 | `m` | mute / unmute the highlighted talkgroup |
 | `+` `-` `0` | output volume up / down / mute |
