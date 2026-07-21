@@ -54,6 +54,12 @@ else
     # is deliberately no -dev package to install for audio.
     PLATFORM_LIBS := -lpthread -ldl
     POSTLINK      = :
+    # glibc hides strcasestr, strncasecmp and the BSD string helpers behind
+    # feature macros; macOS exposes them unconditionally. _GNU_SOURCE turns
+    # them on. Without it the Linux build fails to compile (implicit
+    # declaration of strcasestr) — the single most likely portability break,
+    # since the project has so far only been built on macOS.
+    CPPFLAGS += -D_GNU_SOURCE
 endif
 
 # ------------------------------------------------------------- pkg-config
