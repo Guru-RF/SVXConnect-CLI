@@ -47,6 +47,7 @@ struct svx_dev {
 
     _Atomic uint32_t underruns;
     _Atomic uint32_t overruns;
+    _Atomic int      gate;           /* playback: 0 = emit silence, do not drain */
     _Atomic int      event;          /* svx_dev_event, set by the RT thread */
     _Atomic int      saw_nonsilence;
 
@@ -213,6 +214,15 @@ static void on_playback(ma_device *dev, void *out, const void *in, ma_uint32 n) 
     svx_dev *d = (svx_dev *)dev->pUserData;
     int16_t *o = (int16_t *)out;
 
+    /* Gate closed: emit silence and leave the ring alone so it can fill.
+     * Draining here regardless is what keeps a jitter buffer permanently
+     * starved, because the device always takes exactly as much as arrives. */
+    if (!atomic_load_explicit(&d->gate, memory_order_relaxed)) {
+        memset(o, 0, (size_t)n * sizeof(int16_t));
+        atomic_store_explicit(d->peak, 0.0f, memory_order_relaxed);
+        return;
+    }
+
     uint32_t got = svx_ring_read(d->ring, o, n);
     if (got < n) {
         memset(o + got, 0, (n - got) * sizeof(int16_t));
@@ -308,6 +318,10 @@ svx_dev *svx_dev_open_capture(const char *id, svx_ring *to_app, _Atomic float *p
 
 svx_dev *svx_dev_open_playback(const char *id, svx_ring *from_app, _Atomic float *peak) {
     return dev_open(0, id, from_app, peak);
+}
+
+void svx_dev_set_gate(svx_dev *d, int open) {
+    if (d) atomic_store_explicit(&d->gate, open ? 1 : 0, memory_order_relaxed);
 }
 
 int svx_dev_start(svx_dev *d) {

@@ -82,6 +82,15 @@ int   svx_dev_start(svx_dev *d);
 int   svx_dev_stop (svx_dev *d);          /* idempotent */
 void  svx_dev_close(svx_dev *d);
 
+/* Playback only: open or close the output gate.
+ *
+ * While the gate is CLOSED the callback emits silence and does NOT drain the
+ * ring, which is what lets the jitter buffer accumulate its prefill. Without
+ * this the device consumes every sample the instant it arrives, the ring
+ * hovers at empty, the prefill target is never reached and playback stutters
+ * permanently. The gate starts closed. */
+void  svx_dev_set_gate(svx_dev *d, int open);
+
 const char *svx_dev_name(svx_dev *d);
 uint32_t    svx_dev_underruns(svx_dev *d);   /* playback: starved callbacks */
 uint32_t    svx_dev_overruns (svx_dev *d);   /* capture: samples dropped    */
