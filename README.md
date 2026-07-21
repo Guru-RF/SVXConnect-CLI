@@ -171,10 +171,9 @@ talkgroup. `make test` runs 26 talkgroup-manager fixtures.
 
 ## Licence
 
-GPL-3.0-or-later — see [LICENSE](LICENSE) and
-[THIRD-PARTY-NOTICES](THIRD-PARTY-NOTICES).
+MIT — see [LICENSE](LICENSE) and [THIRD-PARTY-NOTICES](THIRD-PARTY-NOTICES).
 
-Copyright (C) 2026 Joeri Van Dooren, ON3URE.
+Copyright (c) 2026 Joeri Van Dooren, ON3URE.
 
 ## Headless and scripted use
 

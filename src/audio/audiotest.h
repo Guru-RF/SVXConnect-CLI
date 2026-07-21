@@ -1,5 +1,5 @@
-/* SPDX-License-Identifier: GPL-3.0-or-later
- * SVXConnect-CLI — Copyright (C) 2026 Joeri Van Dooren
+/* SPDX-License-Identifier: MIT
+ * SVXConnect-CLI — Copyright (c) 2026 Joeri Van Dooren
  */
 #ifndef SVX_AUDIOTEST_H
 #define SVX_AUDIOTEST_H

@@ -1,11 +1,8 @@
-/* SPDX-License-Identifier: GPL-3.0-or-later
+/* SPDX-License-Identifier: MIT
  * SVXConnect-CLI — a terminal client for SvxLink reflectors.
- * Copyright (C) 2026 Joeri Van Dooren
+ * Copyright (c) 2026 Joeri Van Dooren
  *
- * This program is free software: you can redistribute it and/or modify it
- * under the terms of the GNU General Public License as published by the Free
- * Software Foundation, either version 3 of the License, or (at your option)
- * any later version. See LICENSE.
+ * Released under the MIT License; see LICENSE.
  */
 #include "common/config.h"
 #include "common/log.h"

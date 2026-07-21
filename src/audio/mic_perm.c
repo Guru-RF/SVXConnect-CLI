@@ -1,5 +1,5 @@
-/* SPDX-License-Identifier: GPL-3.0-or-later
- * SVXConnect-CLI — Copyright (C) 2026 Joeri Van Dooren
+/* SPDX-License-Identifier: MIT
+ * SVXConnect-CLI — Copyright (c) 2026 Joeri Van Dooren
  *
  * Microphone permission, wrapped so the rest of the program never has to know
  * which platform it is on. On macOS this defers to mic_tcc.m; everywhere else

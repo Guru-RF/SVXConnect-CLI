@@ -1,5 +1,5 @@
 # SVXConnect-CLI — a terminal client for SvxLink reflectors.
-# SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-License-Identifier: MIT
 #
 # Build targets: macOS (Homebrew) and Debian / Raspberry Pi OS / Ubuntu.
 #

@@ -1,9 +1,9 @@
 SVXConnect-CLI — third-party components
 =======================================
 
-SVXConnect-CLI itself is licensed GPL-3.0-or-later (see LICENSE).
+SVXConnect-CLI itself is licensed under the MIT License (see LICENSE).
 It links against, or vendors, the following third-party components. All are
-GPL-3.0 compatible.
+permissive licences compatible with MIT distribution.
 
 
 libopus
@@ -17,15 +17,14 @@ Licensed under the 3-clause BSD license. https://opus-codec.org/
 OpenSSL 3
 ---------
 Copyright (c) 1998-2024 The OpenSSL Project Authors.
-Licensed under the Apache License 2.0, which is compatible with GPL-3.0.
-Section 4 of Apache-2.0 requires the NOTICE file to be retained in binary
-distributions. https://www.openssl.org/
+Licensed under the Apache License 2.0. Section 4 of Apache-2.0 asks that the
+NOTICE text be retained in binary distributions. https://www.openssl.org/
 
 
 ncurses
 -------
 Copyright (c) 1998-2024 Free Software Foundation, Inc.
-Licensed under the X11-style ncurses license (MIT-like, GPL compatible).
+Licensed under the X11-style ncurses license (MIT-like).
 https://invisible-island.net/ncurses/
 
 
@@ -45,11 +44,14 @@ Neither is a build dependency and neither is distributed with this project.
 Code provenance
 ---------------
 The SvxLink reflector v3 protocol, TLS, AES-GCM and Opus layers are derived
-from the author's own prior C work in the SvxBridge project, relicensed here
-under GPL-3.0-or-later by the copyright holder (Joeri Van Dooren).
+from the author's own prior C work in the SvxBridge project, and are made
+available here under the MIT License by the copyright holder (Joeri Van Dooren).
 
 Protocol message numbers and field layouts are transcribed from the author's
 own SVXConnect-OSX implementation. No code from the upstream SvxLink project
-(GPL-2.0) has been copied, and none of SvxBridge's GPL-2.0-derived DMR,
-D-STAR, DCS or AMBE modules are used here — a reflector client needs none of
-them.
+(GPL-2.0) has been copied.
+
+None of SvxBridge's DMR, D-STAR, DCS or AMBE modules are used here. Some of
+those are derived from third-party GPL-2.0 code (G4KLX MMDVMHost /
+ircDDBGateway); importing any of them would be incompatible with this project's
+MIT licence, and a reflector client needs none of them.

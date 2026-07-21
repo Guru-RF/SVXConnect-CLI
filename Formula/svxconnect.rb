@@ -3,7 +3,7 @@ class Svxconnect < Formula
   homepage "https://github.com/Guru-RF/SVXConnect-CLI"
   url "https://github.com/Guru-RF/SVXConnect-CLI/archive/refs/tags/v0.1.0.tar.gz"
   sha256 "REPLACE_WITH_shasum_-a_256_OF_THE_RELEASE_TARBALL"
-  license "GPL-3.0-or-later"
+  license "MIT"
   head "https://github.com/Guru-RF/SVXConnect-CLI.git", branch: "main"
 
   depends_on "pkg-config" => :build

@@ -1,5 +1,5 @@
-/* SPDX-License-Identifier: GPL-3.0-or-later
- * SVXConnect-CLI — Copyright (C) 2026 Joeri Van Dooren
+/* SPDX-License-Identifier: MIT
+ * SVXConnect-CLI — Copyright (c) 2026 Joeri Van Dooren
  *
  * Crypto fixtures — round-trip, and specifically the replay protection, since
  * that path handles attacker-controlled input from the network and a mistake
