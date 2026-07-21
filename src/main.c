@@ -11,6 +11,7 @@
 #include "common/log.h"
 #include "common/util.h"
 #include "headless.h"
+#include "reflector/enroll.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -178,10 +179,11 @@ int main(int argc, char **argv) {
         config_dump(&cfg, stdout);
         return 0;
 
-    case MODE_ENROLL:
+    case MODE_ENROLL: {
         if (config_validate(&cfg, 1) != 0) return 1;
-        fprintf(stderr, "svxconnect: --enroll is not implemented yet (milestone M2)\n");
-        return 69;   /* EX_UNAVAILABLE */
+        int rc = enroll_run(&cfg, 30);
+        return rc == 0 ? 0 : (rc > 0 ? 1 : 2);
+    }
 
     case MODE_LIST_DEVICES:
     case MODE_AUDIO_TEST:

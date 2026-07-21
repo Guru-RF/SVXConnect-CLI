@@ -3,6 +3,7 @@
  */
 #include "handshake.h"
 #include "nodeinfo.h"
+#include "frameio.h"
 
 #include "common/log.h"
 #include "common/net.h"
@@ -23,104 +24,6 @@
 #define HS_STEP_MS     15000         /* per-message patience once connected */
 
 #define FAIL(r, ...) do { snprintf((r)->err, sizeof((r)->err), __VA_ARGS__); goto fail; } while (0)
-
-/* ------------------------------------------------- plain socket helpers */
-
-static int raw_send_all(int fd, const uint8_t *p, size_t len) {
-    while (len > 0) {
-        ssize_t n = send(fd, p, len, 0);
-        if (n < 0) { if (errno == EINTR) continue; return -1; }
-        if (n == 0) return -1;
-        p += n; len -= (size_t)n;
-    }
-    return 0;
-}
-
-static int raw_recv_all(int fd, uint8_t *p, size_t len, int timeout_ms,
-                        volatile sig_atomic_t *abort_flag) {
-    uint64_t deadline = now_ms() + (uint64_t)timeout_ms;
-    while (len > 0) {
-        if (abort_flag && *abort_flag) return -1;
-
-        uint64_t now = now_ms();
-        if (now >= deadline) { errno = ETIMEDOUT; return -1; }
-
-        struct pollfd pf = { .fd = fd, .events = POLLIN };
-        int pr = poll(&pf, 1, (int)(deadline - now));
-        if (pr < 0) { if (errno == EINTR) continue; return -1; }
-        if (pr == 0) { errno = ETIMEDOUT; return -1; }
-
-        ssize_t n = recv(fd, p, len, 0);
-        if (n < 0) { if (errno == EINTR) continue; return -1; }
-        if (n == 0) { errno = ECONNRESET; return -1; }
-        p += n; len -= (size_t)n;
-    }
-    return 0;
-}
-
-/* Read one pre-TLS frame: [u32 len][body]. Returns the body length or -1. */
-static ssize_t raw_recv_frame(int fd, uint8_t *buf, size_t cap, int timeout_ms,
-                              volatile sig_atomic_t *abort_flag) {
-    uint8_t hdr[4];
-    if (raw_recv_all(fd, hdr, 4, timeout_ms, abort_flag) != 0) return -1;
-    uint32_t L = be_get_u32(hdr);
-    if (L > cap) return -1;
-    if (L == 0) return 0;
-    if (raw_recv_all(fd, buf, L, timeout_ms, abort_flag) != 0) return -1;
-    return (ssize_t)L;
-}
-
-/* ---------------------------------------------------------- TLS helpers */
-
-/* Read one framed message over TLS, blocking with a timeout. The socket is
- * non-blocking by now, so this drives tls_pump_in() from poll(). */
-static ssize_t tls_recv_frame(tls_conn_t *t, uint8_t *buf, size_t cap,
-                              int timeout_ms, volatile sig_atomic_t *abort_flag) {
-    uint64_t deadline = now_ms() + (uint64_t)timeout_ms;
-
-    for (;;) {
-        /* Serve a complete frame out of what we already hold before waiting
-         * on the socket — one TLS record often carries several frames. */
-        size_t         have = 0;
-        const uint8_t *p    = tls_peek(t, &have);
-        if (have >= 4) {
-            uint32_t L = be_get_u32(p);
-            if (L > cap) return -1;
-            if (have >= 4 + (size_t)L) {
-                memcpy(buf, p + 4, L);
-                tls_consume(t, 4 + (size_t)L);
-                return (ssize_t)L;
-            }
-        }
-
-        if (abort_flag && *abort_flag) return -1;
-        uint64_t now = now_ms();
-        if (now >= deadline) { errno = ETIMEDOUT; return -1; }
-
-        if (tls_flush(t) != 0) return -1;
-
-        struct pollfd pf = {
-            .fd     = t->fd,
-            .events = (short)(POLLIN | (tls_want_write(t) ? POLLOUT : 0))
-        };
-        int pr = poll(&pf, 1, (int)(deadline - now));
-        if (pr < 0) { if (errno == EINTR) continue; return -1; }
-        if (pr == 0) { errno = ETIMEDOUT; return -1; }
-
-        if (pf.revents & POLLOUT) { if (tls_flush(t) != 0) return -1; }
-        if (pf.revents & (POLLIN | POLLHUP | POLLERR)) {
-            if (tls_pump_in(t) < 0) return -1;
-        }
-    }
-}
-
-static int tls_send_frame(tls_conn_t *t, const uint8_t *buf, size_t len) {
-    if (tls_queue(t, buf, len) != 0) return -1;
-    if (tls_flush(t) != 0) return -1;
-    /* tls_flush may leave bytes queued if the socket is full; that is fine,
-     * the next tls_recv_frame() will push them. */
-    return 0;
-}
 
 /* ------------------------------------------------------------- the flow */
 
@@ -171,7 +74,7 @@ int handshake_run(const svx_config *cfg, handshake_result *out,
     /* ---- 4. announce the protocol version, in the clear ---- */
     size_t blen;
     if (proto_build_proto_ver(buf, HS_BUF, &blen) != 0) FAIL(out, "internal: ProtoVer");
-    if (raw_send_all(out->tcp_fd, buf, blen) != 0) FAIL(out, "connection lost sending ProtoVer");
+    if (fio_raw_send(out->tcp_fd, buf, blen) != 0) FAIL(out, "connection lost sending ProtoVer");
 
     /* ---- 5. pre-TLS: fetch the CA bundle, then ask to start encryption ----
      * The server drives this. We answer heartbeats, request the bundle when it
@@ -180,7 +83,7 @@ int handshake_run(const svx_config *cfg, handshake_result *out,
     while (!started_tls) {
         if (abort_flag && *abort_flag) FAIL(out, "cancelled");
 
-        ssize_t L = raw_recv_frame(out->tcp_fd, buf, HS_BUF, HS_STEP_MS, abort_flag);
+        ssize_t L = fio_raw_recv_frame(out->tcp_fd, buf, HS_BUF, HS_STEP_MS, abort_flag);
         if (L < 0) FAIL(out, "no response from %s (%s)", out->host, strerror(errno));
         if (L < 2) continue;
 
@@ -188,12 +91,12 @@ int handshake_run(const svx_config *cfg, handshake_result *out,
         switch (type) {
         case MSG_HEARTBEAT:
             if (proto_build_heartbeat(buf, HS_BUF, &blen) != 0) FAIL(out, "internal: Heartbeat");
-            if (raw_send_all(out->tcp_fd, buf, blen) != 0) FAIL(out, "connection lost");
+            if (fio_raw_send(out->tcp_fd, buf, blen) != 0) FAIL(out, "connection lost");
             break;
 
         case MSG_CA_INFO:
             if (proto_build_ca_bundle_req(buf, HS_BUF, &blen) != 0) FAIL(out, "internal: CABundleReq");
-            if (raw_send_all(out->tcp_fd, buf, blen) != 0) FAIL(out, "connection lost");
+            if (fio_raw_send(out->tcp_fd, buf, blen) != 0) FAIL(out, "connection lost");
             break;
 
         case MSG_CA_BUNDLE_RESPONSE: {
@@ -206,7 +109,7 @@ int handshake_run(const svx_config *cfg, handshake_result *out,
                 free(pem);
             }
             if (proto_build_start_enc_req(buf, HS_BUF, &blen) != 0) FAIL(out, "internal: StartEncReq");
-            if (raw_send_all(out->tcp_fd, buf, blen) != 0) FAIL(out, "connection lost");
+            if (fio_raw_send(out->tcp_fd, buf, blen) != 0) FAIL(out, "connection lost");
             break;
         }
 
@@ -243,7 +146,7 @@ int handshake_run(const svx_config *cfg, handshake_result *out,
     while (!(got_server_info && got_udp)) {
         if (abort_flag && *abort_flag) FAIL(out, "cancelled");
 
-        ssize_t L = tls_recv_frame(&out->tls, buf, HS_BUF, HS_STEP_MS, abort_flag);
+        ssize_t L = fio_tls_recv_frame(&out->tls, buf, HS_BUF, HS_STEP_MS, abort_flag);
         if (L < 0) FAIL(out, "login failed (%s)", strerror(errno));
         if (L < 2) continue;
 
@@ -251,7 +154,7 @@ int handshake_run(const svx_config *cfg, handshake_result *out,
         switch (type) {
         case MSG_HEARTBEAT:
             if (proto_build_heartbeat(buf, HS_BUF, &blen) != 0) FAIL(out, "internal: Heartbeat");
-            if (tls_send_frame(&out->tls, buf, blen) != 0) FAIL(out, "connection lost");
+            if (fio_tls_send(&out->tls, buf, blen) != 0) FAIL(out, "connection lost");
             break;
 
         case MSG_AUTH_CHALLENGE: {
@@ -261,7 +164,7 @@ int handshake_run(const svx_config *cfg, handshake_result *out,
             memset(digest, 0, sizeof(digest));
             if (proto_build_auth_response(buf, HS_BUF, &blen, cfg->callsign, digest) != 0)
                 FAIL(out, "internal: AuthResponse");
-            if (tls_send_frame(&out->tls, buf, blen) != 0) FAIL(out, "connection lost");
+            if (fio_tls_send(&out->tls, buf, blen) != 0) FAIL(out, "connection lost");
             break;
         }
 
@@ -292,7 +195,7 @@ int handshake_run(const svx_config *cfg, handshake_result *out,
                                       out->crypto.tx_key,     sizeof(out->crypto.tx_key),
                                       json, jlen) != 0)
                 FAIL(out, "internal: NodeInfo");
-            if (tls_send_frame(&out->tls, buf, blen) != 0) FAIL(out, "connection lost");
+            if (fio_tls_send(&out->tls, buf, blen) != 0) FAIL(out, "connection lost");
             got_server_info = 1;
             break;
         }
