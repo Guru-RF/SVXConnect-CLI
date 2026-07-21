@@ -120,9 +120,12 @@ void jitter_tick(svx_jitter *j, uint64_t now) {
                 log_dbg("jitter: underrun, refilling");
             }
         } else if (avail > j->max_samples) {
-            /* Clock drift or a late join. Drop 20 ms of the oldest audio. */
-            uint32_t drop = SVX_FRAME;
-            j->n_dropped += svx_ring_discard(j->ring, drop);
+            /* Clock drift or a late join. Ask the CONSUMER to drop 20 ms of the
+             * oldest audio; we must not advance the tail from this thread. The
+             * request accumulates and svx_ring_discard caps to what is actually
+             * buffered, so a tick outrunning a callback can never over-drop. */
+            svx_dev_request_drop(j->dev, SVX_FRAME);
+            j->n_dropped += SVX_FRAME;
             log_dbg("jitter: %u ms buffered, dropping 20 ms to catch up",
                     avail * 1000 / SVX_RATE);
         }
@@ -141,7 +144,11 @@ void jitter_end_of_stream(svx_jitter *j) {
 
 void jitter_flush(svx_jitter *j) {
     gate(j, 0);
-    svx_ring_reset(j->ring);
+    /* Clearing the ring is a tail operation, so the consumer does it. If there
+     * is no device (the tests, and any front end that never opened audio) we
+     * are the only thread touching the ring and can reset it directly. */
+    if (j->dev) svx_dev_request_flush(j->dev);
+    else        svx_ring_reset(j->ring);
     j->state         = JB_IDLE;
     j->last_audio_ms = 0;
     /* The decoder's state belongs to the stream we just abandoned; carrying it
@@ -154,7 +161,12 @@ void jitter_trim_tail(svx_jitter *j, int ms) {
     uint32_t want  = (uint32_t)ms * SVX_RATE / 1000;
     uint32_t avail = svx_ring_avail(j->ring);
     if (want > avail) want = avail;
-    j->n_dropped += svx_ring_discard(j->ring, want);
+    if (want == 0) return;
+    /* Dropping the tail is the consumer's job — request it rather than racing
+     * the callback. */
+    if (j->dev) svx_dev_request_drop(j->dev, want);
+    else        svx_ring_discard(j->ring, want);
+    j->n_dropped += want;
 }
 
 void jitter_set_volume(svx_jitter *j, int pct) {

@@ -91,6 +91,17 @@ void  svx_dev_close(svx_dev *d);
  * permanently. The gate starts closed. */
 void  svx_dev_set_gate(svx_dev *d, int open);
 
+/* Playback only: ask the RT callback to drop buffered audio.
+ *
+ * The ring's tail belongs to the consumer (the RT callback), so only it may
+ * advance the tail. When the main thread wants to clear the buffer on a
+ * talkgroup change (flush) or trim a squelch tail (drop), it requests the drop
+ * here and the callback performs it, keeping the tail single-writer. Doing the
+ * discard directly from the main thread would be a data race against the live
+ * callback. */
+void  svx_dev_request_flush(svx_dev *d);
+void  svx_dev_request_drop (svx_dev *d, uint32_t samples);
+
 const char *svx_dev_name(svx_dev *d);
 uint32_t    svx_dev_underruns(svx_dev *d);   /* playback: starved callbacks */
 uint32_t    svx_dev_overruns (svx_dev *d);   /* capture: samples dropped    */

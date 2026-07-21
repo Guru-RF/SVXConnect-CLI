@@ -154,28 +154,15 @@ ssize_t crypto_decrypt_wire(crypto_ctx_t *c,
 
     if (ct_len > out_cap) return -1;
 
-    /* Replay check BEFORE spending a GCM operation on it. A forged counter
-     * still has to survive the tag check below, so this ordering is safe and
-     * costs an attacker nothing they did not already have. */
-    int gap = 0;
-    if (c->rx_have_high) {
-        if (counter <= c->rx_high) {
-            uint32_t behind = c->rx_high - counter;
-            if (behind < CRYPTO_REPLAY_WINDOW) {
-                c->n_replayed++;
-                return -1;              /* duplicate or reordered-but-stale */
-            }
-            /* Further back than the window: the server restarted its counter. */
-            c->n_resync++;
-            c->rx_have_high = 0;
-        } else {
-            /* Cap the reported gap: a huge jump is a resync, not 4 billion
-             * lost packets, and the caller must not try to conceal them all. */
-            uint32_t ahead = counter - c->rx_high - 1;
-            gap = ahead > 16 ? 16 : (int)ahead;
-        }
-    }
-
+    /* AUTHENTICATE FIRST, then decide about replay — never the other way round.
+     *
+     * The counter is authenticated (it is the GCM AAD), so an attacker cannot
+     * forge one: changing the counter changes the AAD and the tag check fails
+     * here. Doing any replay bookkeeping before this point lets an unauth'd
+     * attacker drive that bookkeeping with a made-up counter. An earlier
+     * version cleared the replay high-water mark on a "resync" branch before
+     * this check, which let a spoofed past-window counter DISABLE replay
+     * protection and then replay captured audio. */
     uint8_t iv[12];
     memcpy(iv, c->rx_iv_rand, 6);
     iv[6] = 0; iv[7] = 0;
@@ -185,11 +172,28 @@ ssize_t crypto_decrypt_wire(crypto_ctx_t *c,
     if (aes_gcm_decrypt(c->rx_key, iv, 12, aad, 4, ct, (int)ct_len,
                         tag, 8, out, &pt_len) < 0) {
         c->n_auth_fail++;
-        return -1;
+        return -1;                       /* forged or corrupt: no state change */
     }
 
-    /* Only advance the high-water mark once the tag has verified, so a forged
-     * datagram with a large counter cannot lock out the real stream. */
+    /* Authenticated. Now enforce strict monotonicity.
+     *
+     * The RX key is fixed for the whole connection (crypto_set_rx resets this
+     * state once, at MsgStartUDPEncryption) and the server's counter only ever
+     * increases within a connection, so a counter that is not strictly greater
+     * than the last accepted one is a replay or a stale reorder — never a
+     * legitimate reset. Drop it. There is deliberately no "resync backwards"
+     * path: it could be driven by replaying an old authenticated packet. A
+     * genuine server restart brings a new key and a fresh crypto_set_rx. */
+    int gap = 0;
+    if (c->rx_have_high) {
+        if (counter <= c->rx_high) {
+            c->n_replayed++;
+            return -1;                   /* replay or stale reorder: drop */
+        }
+        uint32_t ahead = counter - c->rx_high - 1;   /* apparent loss before this */
+        gap = ahead > 16 ? 16 : (int)ahead;          /* cap: conceal a few, not billions */
+    }
+
     c->rx_high      = counter;
     c->rx_have_high = 1;
 

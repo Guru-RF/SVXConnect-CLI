@@ -46,10 +46,6 @@ struct svx_app {
     uint64_t          tx_frames;
     int16_t           tx_pcm[SVX_FRAME];
 
-    /* who is talking right now, so PTT can refuse a busy talkgroup */
-    uint32_t          busy_tg;
-    char              busy_call[64];
-
     tg_manager        tgm;
     ctl_fifo          ctl;
     int               quit;
@@ -106,28 +102,17 @@ static void hl_state(void *u, rc_state st, const char *detail) {
 static void hl_talker_start(void *u, uint32_t tg, const char *call) {
     svx_app *a = u;
     log_info("TALKER START  TG %-6u %s", tg, call);
-    if (tg == rc_current_tg(a->rc)) {
-        a->busy_tg = tg;
-        snprintf(a->busy_call, sizeof(a->busy_call), "%s", call);
-    }
+    /* The manager tracks every active talker on every watched talkgroup; the
+     * PTT busy-guard reads that, so nothing extra needs recording here. */
     tgm_on_talker_start(&a->tgm, tg, call);
 }
 
 static void hl_talker_stop(void *u, uint32_t tg, const char *call) {
     svx_app *a = u;
     log_info("TALKER STOP   TG %-6u %s", tg, call);
-
-    /* Match on the CALLSIGN, not the talkgroup: the tg the server reports on
-     * stop can differ from the one it reported on start, and filtering on both
-     * leaves a ghost talker that never clears. */
-    char stop_base[64], busy_base[64];
-    call_strip_ssid(stop_base, sizeof(stop_base), call);
-    call_strip_ssid(busy_base, sizeof(busy_base), a->busy_call);
-    if (a->busy_call[0] && strcmp(stop_base, busy_base) == 0) {
-        a->busy_tg = 0;
-        a->busy_call[0] = '\0';
-    }
-    /* The manager owns the roger beep, the tail trim and the linger window. */
+    /* The manager owns talker bookkeeping, the roger beep, the tail trim and
+     * the linger window — and matches the stop on callsign, since the server
+     * may report it on a different talkgroup than the start. */
     tgm_on_talker_stop(&a->tgm, tg, call);
     if (a->audio_ready) jitter_end_of_stream(&a->jb);
 }
@@ -253,14 +238,26 @@ static int tx_start(svx_app *a) {
         tx_beep(a, 3);
         return -1;
     }
-    if (a->busy_call[0]) {
-        char mine[64], theirs[64];
-        call_strip_ssid(mine,   sizeof(mine),   a->cfg->callsign);
-        call_strip_ssid(theirs, sizeof(theirs), a->busy_call);
-        if (strcmp(mine, theirs) != 0) {
-            log_warn("PTT refused: %s is talking on TG %u", a->busy_call, a->busy_tg);
-            tx_beep(a, 2);
-            return -1;
+    /* Refuse to key up over a station already talking on our talkgroup.
+     *
+     * Ask the talkgroup manager, not the busy_tg/busy_call shortcut: that
+     * shortcut is only set when a talker_start arrives while we are ALREADY on
+     * their talkgroup, so a station that was already transmitting when we
+     * switched onto their talkgroup is invisible to it — and we would key
+     * straight over them. The manager tracks every active talker on every
+     * watched talkgroup, so tgm_talker_on(selected) is the authoritative
+     * answer. */
+    {
+        const tgm_talker *t = tgm_talker_on(&a->tgm, tgm_selected(&a->tgm));
+        if (t) {
+            char mine[64], theirs[64];
+            call_strip_ssid(mine,   sizeof(mine),   a->cfg->callsign);
+            call_strip_ssid(theirs, sizeof(theirs), t->call);
+            if (strcmp(mine, theirs) != 0) {
+                log_warn("PTT refused: %s is talking on TG %u", t->call, t->tg);
+                tx_beep(a, 2);
+                return -1;
+            }
         }
     }
     if (a->no_tx || !a->tx_ready) {
@@ -416,8 +413,6 @@ static void tgm_do_select(void *u, uint32_t tg, int gate) {
     svx_app *a = u;
     if (a->tx_active) tx_stop(a, "talkgroup changed");
     if (gate && a->audio_ready) jitter_flush(&a->jb);
-    a->busy_tg = 0;
-    a->busy_call[0] = '\0';
     rc_select_tg(a->rc, tg);
 }
 
@@ -465,7 +460,15 @@ static void ctl_mute(void *u, uint32_t tg, int mute) {
 
 static void ctl_volume(void *u, int pct) {
     svx_app *a = u;
+    /* Mirror into cfg, exactly as the keyboard path does — otherwise the TUI
+     * keeps showing the old level and the next volume keypress, which computes
+     * from cfg->output_volume_pct, jumps the audio back. Same 0..100 range as
+     * the keys, so the two controls agree. */
+    pct = CLAMP(pct, 0, 100);
+    ((svx_config *)a->cfg)->output_volume_pct = pct;
+    a->out_muted = 0;
     if (a->audio_ready) jitter_set_volume(&a->jb, pct);
+    notify(a);
     log_info("volume %d%%", pct);
 }
 

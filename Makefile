@@ -19,6 +19,12 @@ LDFLAGS  ?=
 # otherwise beats every assignment in this file, including `+=` — which would
 # silently drop the include path and break the build in a confusing way.
 override CFLAGS += -Isrc -Ithird_party
+# snprintf is bounded and always NUL-terminates, so a truncated diagnostic
+# string (a clipped host name in an error, say) is harmless by construction.
+# gcc's -Wformat-truncation flags exactly that safe pattern; clang does not
+# enable it at all. Turn it off so the two compilers agree and the build stays
+# warning-clean on both.
+override CFLAGS += -Wno-format-truncation
 
 BUILD  := build
 PREFIX ?= /usr/local
@@ -134,8 +140,17 @@ $(BUILD)/tgtest: $(TEST_OBJ)
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $^ -lm
 
-test: $(BUILD)/tgtest
+CRYPTO_TEST_OBJ := $(BUILD)/tests/cryptotest.o \
+                   $(BUILD)/src/common/crypto.o \
+                   $(BUILD)/src/common/util.o
+
+$(BUILD)/cryptotest: $(CRYPTO_TEST_OBJ)
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $^ -lssl -lcrypto -lm
+
+test: $(BUILD)/tgtest $(BUILD)/cryptotest
 	@$(BUILD)/tgtest
+	@$(BUILD)/cryptotest
 
 asan:
 	$(MAKE) clean

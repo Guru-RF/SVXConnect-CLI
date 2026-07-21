@@ -21,12 +21,6 @@
 #include <stddef.h>
 #include <sys/types.h>
 
-/* How far out of order a datagram may arrive and still be accepted. Beyond
- * this behind the high-water mark we treat it as a replay and drop it; a jump
- * further back than this is read as the server having restarted its counter,
- * and we resynchronise. */
-#define CRYPTO_REPLAY_WINDOW 64
-
 typedef struct {
     /* TX */
     uint8_t  tx_iv_rand[6];
@@ -43,9 +37,8 @@ typedef struct {
     int      rx_have_high;
 
     /* Counters, for the status bar. */
-    uint64_t n_replayed;       /* dropped inside the replay window */
-    uint64_t n_resync;         /* counter jumped backwards past the window */
-    uint64_t n_auth_fail;      /* GCM tag mismatch */
+    uint64_t n_replayed;       /* authenticated but non-monotonic: dropped */
+    uint64_t n_auth_fail;      /* GCM tag mismatch: forged or corrupt */
 } crypto_ctx_t;
 
 void crypto_init(crypto_ctx_t *c);
@@ -74,8 +67,10 @@ ssize_t crypto_encrypt_wire(crypto_ctx_t *c,
  * datagrams appear to have been lost immediately before this one (0 when the
  * sequence is unbroken, and always 0 on the first packet).
  *
- * Replays and out-of-window duplicates return -1 after bumping n_replayed, so
- * a caller that only checks the return value still behaves correctly. */
+ * The datagram is AUTHENTICATED before any replay bookkeeping happens, so a
+ * forged counter cannot influence the replay state — it fails the GCM tag
+ * first. Acceptance is then strictly monotonic in the authenticated counter:
+ * a replay or stale reorder returns -1 after bumping n_replayed. */
 ssize_t crypto_decrypt_wire(crypto_ctx_t *c,
                             const uint8_t *wire, size_t wire_len,
                             uint8_t *out, size_t out_cap,

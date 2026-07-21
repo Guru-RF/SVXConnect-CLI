@@ -127,10 +127,15 @@ fail:
     if (t->ssl) { SSL_free(t->ssl); t->ssl = NULL; }
     free(t->in);  t->in  = NULL; t->in_cap  = 0;
     free(t->out); t->out = NULL; t->out_cap = 0;
-    /* Disown the fd. We never took ownership of it — the caller passed it in
-     * and still has to close it — and leaving it here would make a later
-     * tls_close() close it a second time, which on a busy process can end up
-     * closing an unrelated socket that happened to reuse the descriptor. */
+    /* Clear handshake_done too, not just fd.
+     *
+     * handshake_release() decides who owns the socket from BOTH ssl != NULL and
+     * handshake_done. If SSL_connect() succeeded (setting handshake_done) but a
+     * later step here failed — net_set_nonblock, say — leaving handshake_done
+     * set would make the caller believe TLS owns the fd while we have disowned
+     * it, and nobody closes it: a leaked TCP socket. Reset both so the caller's
+     * own tcp_fd cleanup runs. */
+    t->handshake_done = 0;
     t->fd = -1;
     return -1;
 }

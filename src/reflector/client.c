@@ -16,6 +16,7 @@
 #include <unistd.h>
 #include <errno.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <sys/socket.h>
 
 #define RC_MAX_FRAME   (256 * 1024)
@@ -40,7 +41,7 @@ struct rc_client {
     /* connect worker */
     pthread_t         worker;
     int               worker_running;
-    int               worker_done;    /* written by the worker, read after join */
+    _Atomic int       worker_done;    /* worker sets (release); main reads (acquire) */
     handshake_result  worker_result;
     int               worker_rc;
     volatile sig_atomic_t worker_abort;
@@ -140,10 +141,13 @@ static void *worker_main(void *arg) {
     rc_client *c = arg;
     c->worker_rc = handshake_run(c->cfg, &c->worker_result, &c->worker_abort);
 
-    /* Publish, then wake the main loop. The write is the release barrier that
-     * pairs with pthread_join()'s acquire in the main thread; after the join,
-     * main owns worker_result outright and no locking is needed anywhere. */
-    c->worker_done = 1;
+    /* Publish the result, then flag done with a RELEASE store, then wake the
+     * loop. The main thread reads worker_done with an acquire load before it
+     * has joined, so the release/acquire pair is what makes worker_rc and
+     * worker_result visible to it — the later pthread_join reaps the thread but
+     * is not what synchronises the data. (A plain int flag here is a data race
+     * TSan flags, even though the join makes the result itself safe.) */
+    atomic_store_explicit(&c->worker_done, 1, memory_order_release);
     ssize_t ignored = write(c->wake_pipe[1], "c", 1);
     (void)ignored;
     return NULL;
@@ -549,11 +553,13 @@ void rc_service(rc_client *c, uint64_t now) {
         while (read(c->wake_pipe[0], sink, sizeof(sink)) > 0) { }
     }
 
-    /* Has the connect worker finished? */
-    if (c->worker_running && c->worker_done) {
+    /* Has the connect worker finished? Acquire, to pair with the worker's
+     * release store and see everything it published. */
+    if (c->worker_running &&
+        atomic_load_explicit(&c->worker_done, memory_order_acquire)) {
         pthread_join(c->worker, NULL);
         c->worker_running = 0;
-        c->worker_done    = 0;
+        atomic_store_explicit(&c->worker_done, 0, memory_order_relaxed);
 
         if (c->worker_rc == 0) {
             adopt_connection(c);

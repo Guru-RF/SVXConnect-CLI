@@ -48,6 +48,8 @@ struct svx_dev {
     _Atomic uint32_t underruns;
     _Atomic uint32_t overruns;
     _Atomic int      gate;           /* playback: 0 = emit silence, do not drain */
+    _Atomic int      flush_req;      /* playback: consumer drops everything      */
+    _Atomic uint32_t drop_req;       /* playback: consumer drops this many oldest */
     _Atomic int      event;          /* svx_dev_event, set by the RT thread */
     _Atomic int      saw_nonsilence;
 
@@ -214,6 +216,17 @@ static void on_playback(ma_device *dev, void *out, const void *in, ma_uint32 n) 
     svx_dev *d = (svx_dev *)dev->pUserData;
     int16_t *o = (int16_t *)out;
 
+    /* Flush and catch-up drops are requested by the producer (the main thread)
+     * but PERFORMED here, because svx_ring's tail belongs to the consumer and
+     * this callback is that consumer. Doing them on the producer side would be
+     * two threads writing tail — a data race on a live audio path. Handled
+     * before the gate check so a flush requested while gated still takes
+     * effect. */
+    if (atomic_exchange_explicit(&d->flush_req, 0, memory_order_relaxed))
+        svx_ring_reset(d->ring);
+    uint32_t drop = atomic_exchange_explicit(&d->drop_req, 0, memory_order_relaxed);
+    if (drop) svx_ring_discard(d->ring, drop);
+
     /* Gate closed: emit silence and leave the ring alone so it can fill.
      * Draining here regardless is what keeps a jitter buffer permanently
      * starved, because the device always takes exactly as much as arrives. */
@@ -322,6 +335,15 @@ svx_dev *svx_dev_open_playback(const char *id, svx_ring *from_app, _Atomic float
 
 void svx_dev_set_gate(svx_dev *d, int open) {
     if (d) atomic_store_explicit(&d->gate, open ? 1 : 0, memory_order_relaxed);
+}
+
+void svx_dev_request_flush(svx_dev *d) {
+    if (d) atomic_store_explicit(&d->flush_req, 1, memory_order_relaxed);
+}
+
+void svx_dev_request_drop(svx_dev *d, uint32_t samples) {
+    /* Accumulate: several trims between callbacks must all be honoured. */
+    if (d && samples) atomic_fetch_add_explicit(&d->drop_req, samples, memory_order_relaxed);
 }
 
 int svx_dev_start(svx_dev *d) {
