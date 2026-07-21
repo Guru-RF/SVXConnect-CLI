@@ -9,9 +9,12 @@ and mobile apps: connect to a reflector, monitor a set of talkgroups, switch
 between them with the arrow keys, and transmit — all from an SSH session or a
 terminal window.
 
-> **Status: in development.** Milestones M0 (skeleton + config) is done; the
-> reflector client, audio and UI are being built. See
-> [Roadmap](#roadmap). Not yet usable on the air.
+> **Status: in development, but it works on the air.** The reflector client,
+> certificate enrolment, audio in both directions and the talkgroup manager are
+> all done and verified against a live reflector — a full transmit/receive
+> round-trip through a parrot talkgroup decodes correctly. The ncurses
+> interface is the last piece; until it lands, use `--headless` plus the
+> control FIFO. See [Roadmap](#roadmap).
 
 ```
 ┌─ SVXConnect  ON3URE ────────────────────── be.svx.link:5300  ID 42  nodes 7 ── 20:14:07 ─┐
@@ -152,15 +155,19 @@ See [docs/TCC.md](docs/TCC.md).
 | | Milestone | Status |
 |---|---|---|
 | M0 | Skeleton, config parser, build system | **done** |
-| M1 | Reflector client — mTLS, UDP crypto, heartbeats, reconnect (`--headless`) | in progress |
-| M2 | Certificate enrolment (`--enroll`) | |
-| M3 | Audio device layer (`--list-devices`, `--audio-test`) | |
-| M4 | Receive audio — Opus decode, jitter buffer, loss concealment | |
-| M5 | Transmit audio, PTT via the control FIFO | |
-| M6 | Talkgroup manager — priority, lock, linger, idle, mute | |
-| M7 | ncurses interface | |
-| M8 | Packaging — Homebrew formula, systemd unit | |
-| M9 | Polish — roger beep, tail trim, device picker, soak testing | |
+| M1 | Reflector client — mTLS, UDP crypto, heartbeats, reconnect (`--headless`) | **done** |
+| M2 | Certificate enrolment (`--enroll`) | **done** |
+| M3 | Audio device layer (`--list-devices`, `--audio-test`) | **done** |
+| M4 | Receive audio — Opus decode, jitter buffer, loss concealment | **done** |
+| M5 | Transmit audio, PTT via the control FIFO | **done** |
+| M6 | Talkgroup manager — priority, lock, linger, idle, mute (26 tests) | **done** |
+| M8 | Packaging — Homebrew formula, systemd unit, `DEPLOY.md` | **done** |
+| M7 | ncurses interface | in progress |
+| M9 | Polish — device picker modal, soak testing | |
+
+Everything except the interface is verified against the live `be.svx.link`
+reflector, including a transmit/receive round-trip through the parrot
+talkgroup. `make test` runs 26 talkgroup-manager fixtures.
 
 ## Licence
 
@@ -168,3 +175,31 @@ GPL-3.0-or-later — see [LICENSE](LICENSE) and
 [THIRD-PARTY-NOTICES](THIRD-PARTY-NOTICES).
 
 Copyright (C) 2026 Joeri Van Dooren, ON3URE.
+
+## Headless and scripted use
+
+`svxconnect --headless` runs without an interface, logging events to stdout,
+and is what a systemd unit runs. Everything is controllable through a named
+pipe:
+
+```sh
+echo "tg next"   > ~/.local/state/svxconnect/ctl
+echo "lock on"   > ~/.local/state/svxconnect/ctl
+echo "ptt on"    > ~/.local/state/svxconnect/ctl
+echo "status"    > ~/.local/state/svxconnect/ctl
+```
+
+Full vocabulary in [docs/PTT.md](docs/PTT.md); service setup in
+[DEPLOY.md](DEPLOY.md).
+
+## Building and testing
+
+```sh
+make            # -> build/svxconnect
+make test       # talkgroup manager fixtures
+make asan       # AddressSanitizer + UndefinedBehaviorSanitizer build
+```
+
+Dependencies: OpenSSL 3, libopus, ncurses. Audio needs no development package
+on either platform — [miniaudio](https://miniaud.io/) is vendored in
+`third_party/` and loads the system audio libraries at runtime.
