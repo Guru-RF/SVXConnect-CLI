@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
  * SVXConnect-CLI — Copyright (C) 2026 Joeri Van Dooren
  */
-#include "headless.h"
+#include "app.h"
 
 #include "audio/codec.h"
 #include "audio/dev.h"
@@ -22,11 +22,7 @@
 #include <errno.h>
 #include <poll.h>
 
-static volatile sig_atomic_t g_quit;
-
-static void on_signal(int sig) { (void)sig; g_quit = 1; }
-
-typedef struct {
+struct svx_app {
     const svx_config *cfg;
     rc_client        *rc;
 
@@ -58,14 +54,41 @@ typedef struct {
     ctl_fifo          ctl;
     int               quit;
     uint64_t          last_report;
-} hl_app;
 
-static void tx_stop(hl_app *a, const char *why);
+    /* Output mute remembers the level it was at, so unmuting restores it
+     * rather than jumping to some default. */
+    int               out_muted;
+    int               volume_before_mute;
+
+    /* A message the interface should show until the user dismisses it. */
+    char              banner[240];
+
+    /* Log ring, so the interface can show recent lines without reopening the
+     * log file. Fed by the sink installed in app_new(). */
+    app_log_line      logbuf[APP_LOG_LINES];
+    int               log_head;      /* next slot to write */
+    int               log_count;
+    uint64_t          log_serial;
+
+    void            (*observer)(void *);
+    void             *observer_user;
+};
+
+static void tx_stop(svx_app *a, const char *why);
+
+static void notify(svx_app *a) {
+    if (a->observer) a->observer(a->observer_user);
+}
+
+static void banner_set(svx_app *a, const char *msg) {
+    snprintf(a->banner, sizeof(a->banner), "%s", msg ? msg : "");
+    notify(a);
+}
 
 /* ------------------------------------------------------------ callbacks */
 
 static void hl_state(void *u, rc_state st, const char *detail) {
-    hl_app *a = u;
+    svx_app *a = u;
     if (detail && *detail) log_info("[%s] %s", rc_state_name(st), detail);
     else                   log_info("[%s]", rc_state_name(st));
 
@@ -81,7 +104,7 @@ static void hl_state(void *u, rc_state st, const char *detail) {
 }
 
 static void hl_talker_start(void *u, uint32_t tg, const char *call) {
-    hl_app *a = u;
+    svx_app *a = u;
     log_info("TALKER START  TG %-6u %s", tg, call);
     if (tg == rc_current_tg(a->rc)) {
         a->busy_tg = tg;
@@ -91,7 +114,7 @@ static void hl_talker_start(void *u, uint32_t tg, const char *call) {
 }
 
 static void hl_talker_stop(void *u, uint32_t tg, const char *call) {
-    hl_app *a = u;
+    svx_app *a = u;
     log_info("TALKER STOP   TG %-6u %s", tg, call);
 
     /* Match on the CALLSIGN, not the talkgroup: the tg the server reports on
@@ -110,7 +133,7 @@ static void hl_talker_stop(void *u, uint32_t tg, const char *call) {
 }
 
 static void hl_audio(void *u, const uint8_t *opus, size_t len, int gap) {
-    hl_app *a = u;
+    svx_app *a = u;
     if (!a->audio_ready) return;
     jitter_push(&a->jb, opus, len, gap);
 }
@@ -121,18 +144,19 @@ static void hl_node(void *u, int joined, const char *call) {
 }
 
 static void hl_flushed(void *u) {
-    hl_app *a = u;
+    svx_app *a = u;
     if (a->audio_ready) jitter_end_of_stream(&a->jb);
 }
 
 static void hl_error(void *u, const char *msg) {
-    (void)u;
+    svx_app *a = u;
     log_warn("reflector error: %s", msg);
+    banner_set(a, msg);
 }
 
 /* ------------------------------------------------------- audio set-up */
 
-static int audio_start(hl_app *a) {
+static int audio_start(svx_app *a) {
     if (svx_audio_init() != 0) {
         log_warn("no audio system available — running without sound");
         return -1;
@@ -179,7 +203,7 @@ static int audio_start(hl_app *a) {
     return 0;
 }
 
-static void audio_stop(hl_app *a) {
+static void audio_stop(svx_app *a) {
     if (!a->audio_ready) return;
     a->audio_ready = 0;
     svx_dev_close(a->play_dev);  a->play_dev = NULL;
@@ -194,7 +218,7 @@ static void audio_stop(hl_app *a) {
 /* Short beeps carry meaning, and the vocabulary is the same one the macOS app
  * uses so it transfers between the two: 1 = roger, 2 = channel busy,
  * 3 = no link or no talkgroup selected. */
-static void tx_beep(hl_app *a, int count) {
+static void tx_beep(svx_app *a, int count) {
     if (!a->audio_ready) return;
 
     int16_t tone[SVX_RATE / 8];              /* 125 ms */
@@ -215,7 +239,7 @@ static void tx_beep(hl_app *a, int count) {
     }
 }
 
-static int tx_start(hl_app *a) {
+static int tx_start(svx_app *a) {
     /* The guard chain, in this order. Each refusal has its own beep so the
      * reason is audible without looking at the screen. */
     if (rc_get_state(a->rc) != RC_CONNECTED) {
@@ -265,7 +289,7 @@ static int tx_start(hl_app *a) {
     return 0;
 }
 
-static void tx_stop(hl_app *a, const char *why) {
+static void tx_stop(svx_app *a, const char *why) {
     if (!a->tx_active) return;
     a->tx_active = 0;
 
@@ -284,6 +308,13 @@ static void tx_stop(hl_app *a, const char *why) {
      * that opens fine and delivers perfect zeros. Say so, because otherwise
      * everything looks normal and nobody heard a word. */
     if (a->tx_frames > 20 && !svx_dev_saw_nonsilence(a->cap_dev)) {
+#if defined(__APPLE__)
+        banner_set(a, "MIC BLOCKED - macOS gave us only silence. Grant your terminal "
+                      "Microphone access (Privacy & Security), then restart. 'x' dismisses.");
+#else
+        banner_set(a, "MIC SILENT - the input device produced only silence. "
+                      "Check --list-devices and that it is not muted. 'x' dismisses.");
+#endif
         log_err("the microphone produced nothing but digital silence — nobody heard that.");
 #if defined(__APPLE__)
         log_err("grant Microphone access to your terminal application "
@@ -297,7 +328,7 @@ static void tx_stop(hl_app *a, const char *why) {
 /* Drain whole 20 ms frames out of the capture ring, encode and send them.
  * The device clock paces this: we send exactly as fast as the microphone
  * produces samples, with no wall-clock timer of our own to drift against. */
-static void tx_pump(hl_app *a) {
+static void tx_pump(svx_app *a) {
     if (!a->tx_active) return;
 
     while (svx_ring_avail(&a->cap_ring) >= SVX_FRAME) {
@@ -324,7 +355,7 @@ static void tx_pump(hl_app *a) {
     }
 }
 
-static int tx_open(hl_app *a) {
+static int tx_open(svx_app *a) {
     if (a->no_tx) { log_info("transmit disabled (--no-tx)"); return 0; }
     if (!a->audio_ready) return -1;
 
@@ -337,6 +368,7 @@ static int tx_open(hl_app *a) {
     }
     if (m == SVX_MIC_DENIED) {
         log_warn("microphone access denied — running receive-only. See docs/TCC.md.");
+        banner_set(a, "RX ONLY - microphone access denied. See docs/TCC.md. 'x' dismisses.");
         a->no_tx = 1;
         return -1;
     }
@@ -370,7 +402,7 @@ static int tx_open(hl_app *a) {
     return 0;
 }
 
-static void tx_close(hl_app *a) {
+static void tx_close(svx_app *a) {
     if (!a->tx_ready) return;
     a->tx_ready = 0;
     svx_dev_close(a->cap_dev);  a->cap_dev = NULL;
@@ -381,7 +413,7 @@ static void tx_close(hl_app *a) {
 /* -------------------------------------------- talkgroup manager glue */
 
 static void tgm_do_select(void *u, uint32_t tg, int gate) {
-    hl_app *a = u;
+    svx_app *a = u;
     if (a->tx_active) tx_stop(a, "talkgroup changed");
     if (gate && a->audio_ready) jitter_flush(&a->jb);
     a->busy_tg = 0;
@@ -390,14 +422,14 @@ static void tgm_do_select(void *u, uint32_t tg, int gate) {
 }
 
 static void tgm_do_monitor(void *u, const uint32_t *ids, size_t n) {
-    hl_app *a = u;
+    svx_app *a = u;
     rc_set_monitor(a->rc, ids, n);
 }
 
-static void tgm_do_beep(void *u, int n) { tx_beep((hl_app *)u, n); }
+static void tgm_do_beep(void *u, int n) { tx_beep((svx_app *)u, n); }
 
 static void tgm_do_tail(void *u, int ms) {
-    hl_app *a = u;
+    svx_app *a = u;
     if (a->audio_ready) jitter_trim_tail(&a->jb, ms);
 }
 
@@ -406,14 +438,14 @@ static void tgm_do_changed(void *u) { (void)u; }
 /* ------------------------------------------------------ control FIFO */
 
 static void ctl_ptt(void *u, ctl_tristate v) {
-    hl_app *a = u;
+    svx_app *a = u;
     if (v == CTL_ON)       tx_start(a);
     else if (v == CTL_OFF) tx_stop(a, NULL);
     else                   { if (a->tx_active) tx_stop(a, NULL); else tx_start(a); }
 }
 
 static void ctl_tg(void *u, ctl_tg_kind kind, uint32_t tg) {
-    hl_app *a = u;
+    svx_app *a = u;
     if      (kind == CTL_TG_NEXT) tgm_next(&a->tgm);
     else if (kind == CTL_TG_PREV) tgm_prev(&a->tgm);
     else                          tgm_select(&a->tgm, tg);
@@ -421,24 +453,24 @@ static void ctl_tg(void *u, ctl_tg_kind kind, uint32_t tg) {
 }
 
 static void ctl_lock(void *u, ctl_tristate v) {
-    hl_app *a = u;
+    svx_app *a = u;
     if (v == CTL_TOGGLE) tgm_toggle_lock(&a->tgm);
     else                 tgm_set_lock(&a->tgm, v == CTL_ON);
 }
 
 static void ctl_mute(void *u, uint32_t tg, int mute) {
-    hl_app *a = u;
+    svx_app *a = u;
     if (tgm_is_muted(&a->tgm, tg) != mute) tgm_toggle_mute(&a->tgm, tg);
 }
 
 static void ctl_volume(void *u, int pct) {
-    hl_app *a = u;
+    svx_app *a = u;
     if (a->audio_ready) jitter_set_volume(&a->jb, pct);
     log_info("volume %d%%", pct);
 }
 
 static void ctl_status(void *u) {
-    hl_app *a = u;
+    svx_app *a = u;
     rc_stats st;
     rc_get_stats(a->rc, &st);
     log_info("status: %s, TG %u%s, %s, rx %llu pkt, lost %.1f%%, buffered %u ms",
@@ -449,24 +481,61 @@ static void ctl_status(void *u) {
              a->audio_ready ? jitter_depth_ms(&a->jb) : 0);
 }
 
-static void ctl_quit(void *u) { ((hl_app *)u)->quit = 1; }
+static void ctl_quit(void *u) { ((svx_app *)u)->quit = 1; }
 
-/* ----------------------------------------------------------------- run */
+/* -------------------------------------------------------------- logging */
 
-int run_headless(const svx_config *cfg, int no_tx) {
-    hl_app app;
-    memset(&app, 0, sizeof(app));
-    app.cfg = cfg;
+/* Log sink: keep the last APP_LOG_LINES lines so the interface's log pane has
+ * something to show. Also writes through to the file sink when one is open. */
+static void app_log_sink(int level, const char *line, void *user) {
+    svx_app *a = user;
 
-    /* No SA_RESTART: poll() should return EINTR so the loop notices. */
-    struct sigaction sa;
-    memset(&sa, 0, sizeof(sa));
-    sa.sa_handler = on_signal;
-    sigaction(SIGINT,  &sa, NULL);
-    sigaction(SIGTERM, &sa, NULL);
+    app_log_line *slot = &a->logbuf[a->log_head];
+    slot->level = level;
+    snprintf(slot->text, sizeof(slot->text), "%s", line);
+
+    a->log_head = (a->log_head + 1) % APP_LOG_LINES;
+    if (a->log_count < APP_LOG_LINES) a->log_count++;
+    a->log_serial++;
+}
+
+int app_log_snapshot(const svx_app *a, app_log_line *out, int max) {
+    int n = a->log_count < max ? a->log_count : max;
+    /* Oldest first, so the caller can print top to bottom. */
+    int start = (a->log_head - n + APP_LOG_LINES) % APP_LOG_LINES;
+    for (int i = 0; i < n; i++) out[i] = a->logbuf[(start + i) % APP_LOG_LINES];
+    return n;
+}
+
+uint64_t app_log_serial(const svx_app *a) { return a->log_serial; }
+
+void app_capture_log(svx_app *a) {
+    /* Only a front end that owns the terminal calls this. Under the TUI a
+     * stray log line written to stdout would tear a hole in the screen, so
+     * from here on everything is diverted into the ring above and rendered
+     * by the log pane instead. The headless front end does not call it and
+     * keeps its plain stdout logging. */
+    log_set_sink(app_log_sink, a);
+}
+
+void app_set_observer(svx_app *a, void (*fn)(void *), void *user) {
+    a->observer      = fn;
+    a->observer_user = user;
+}
+
+/* ------------------------------------------------------------- lifetime */
+
+svx_app *app_new(const svx_config *cfg, int no_tx) {
+    svx_app *a = calloc(1, sizeof(*a));
+    if (!a) return NULL;
+
+    a->cfg      = cfg;
+    a->no_tx    = no_tx;
+    a->out_muted = 0;
+    a->volume_before_mute = cfg->output_volume_pct;
 
     rc_callbacks cb = {
-        .user            = &app,
+        .user            = a,
         .on_state        = hl_state,
         .on_talker_start = hl_talker_start,
         .on_talker_stop  = hl_talker_stop,
@@ -475,17 +544,28 @@ int run_headless(const svx_config *cfg, int no_tx) {
         .on_flushed      = hl_flushed,
         .on_error        = hl_error,
     };
+    a->rc = rc_new(cfg, &cb);
+    if (!a->rc) { free(a); return NULL; }
 
-    app.no_tx = no_tx;
+    tgm_callbacks tcb = {
+        .user        = a,
+        .select_tg   = tgm_do_select,
+        .set_monitor = tgm_do_monitor,
+        .beep        = tgm_do_beep,
+        .changed     = tgm_do_changed,
+        .tail_trim   = tgm_do_tail,
+    };
+    tgm_init(&a->tgm, cfg, &tcb);
 
-    app.rc = rc_new(cfg, &cb);
-    if (!app.rc) { log_err("out of memory"); return 1; }
+    return a;
+}
 
-    audio_start(&app);      /* not fatal: monitoring still works without it */
-    tx_open(&app);          /* also not fatal: receive-only is a valid mode  */
+void app_start(svx_app *a) {
+    audio_start(a);    /* not fatal: monitoring still works without sound   */
+    tx_open(a);        /* also not fatal: receive-only is a valid mode      */
 
     ctl_callbacks ccb = {
-        .user      = &app,
+        .user      = a,
         .on_ptt    = ctl_ptt,
         .on_tg     = ctl_tg,
         .on_lock   = ctl_lock,
@@ -494,97 +574,205 @@ int run_headless(const svx_config *cfg, int no_tx) {
         .on_status = ctl_status,
         .on_quit   = ctl_quit,
     };
-    ctl_open(&app.ctl, cfg->ctl_fifo, &ccb);
+    ctl_open(&a->ctl, a->cfg->ctl_fifo, &ccb);
 
-    tgm_callbacks tcb = {
-        .user        = &app,
-        .select_tg   = tgm_do_select,
-        .set_monitor = tgm_do_monitor,
-        .beep        = tgm_do_beep,
-        .changed     = tgm_do_changed,
-        .tail_trim   = tgm_do_tail,
-    };
-    tgm_init(&app.tgm, cfg, &tcb);
+    rc_start(a->rc);
+    a->last_report = now_ms();
+}
+
+void app_free(svx_app *a) {
+    if (!a) return;
+    if (a->tx_active) tx_stop(a, "shutting down");
+    ctl_close(&a->ctl);
+    if (a->rc) { rc_stop(a->rc, "quit"); rc_free(a->rc); }
+    tx_close(a);
+    audio_stop(a);
+    free(a);
+}
+
+/* ------------------------------------------------------------ poll glue */
+
+int app_poll_fds(svx_app *a, struct pollfd *p, int max) {
+    int n = rc_poll_fds(a->rc, p, max);
+    if (ctl_fd(&a->ctl) >= 0 && n < max) {
+        p[n].fd = ctl_fd(&a->ctl);
+        p[n].events = POLLIN;
+        p[n].revents = 0;
+        n++;
+    }
+    return n;
+}
+
+int app_next_timeout_ms(svx_app *a, uint64_t now) {
+    int to = rc_next_timeout_ms(a->rc, now);
+    /* The jitter buffer wants servicing on roughly a frame boundary. While
+     * transmitting, poll the capture ring harder still: the realtime thread
+     * deliberately never wakes us, so this cadence is what bounds the latency
+     * we add on the transmit path. */
+    if (a->audio_ready && to > 20) to = 20;
+    if (a->tx_active   && to > 5)  to = 5;
+    return to;
+}
+
+void app_service(svx_app *a, uint64_t now) {
+    ctl_drain(&a->ctl);
+
+    rc_service(a->rc, now);
+    if (a->audio_ready) jitter_tick(&a->jb, now);
+    tgm_tick(&a->tgm, now);
+    tx_pump(a);
+
+    /* If the link went away mid-over, stop rather than encode into a void. */
+    if (a->tx_active && rc_get_state(a->rc) != RC_CONNECTED)
+        tx_stop(a, "the connection dropped");
+
+    if (now - a->last_report >= 60000) {
+        a->last_report = now;
+        rc_stats st;
+        rc_get_stats(a->rc, &st);
+        log_info("stats: rx %llu pkt (%d/s), tx %llu pkt, lost %llu (%.1f%%), "
+                 "replayed %llu, bad-auth %llu",
+                 (unsigned long long)st.rx_packets, st.rx_pps,
+                 (unsigned long long)st.tx_packets,
+                 (unsigned long long)st.rx_lost, st.loss_pct,
+                 (unsigned long long)st.rx_replayed,
+                 (unsigned long long)st.rx_auth_fail);
+        if (a->audio_ready) {
+            log_info("audio: %llu frames, %llu concealed, %llu underruns, "
+                     "%llu dropped, %u ms buffered",
+                     (unsigned long long)a->jb.n_frames,
+                     (unsigned long long)a->jb.n_concealed,
+                     (unsigned long long)a->jb.n_underruns,
+                     (unsigned long long)a->jb.n_dropped,
+                     jitter_depth_ms(&a->jb));
+        }
+    }
+}
+
+/* ------------------------------------------------------------- actions */
+
+void app_ptt(svx_app *a, ctl_tristate v)     { ctl_ptt(a, v); }
+void app_tg_next(svx_app *a)                 { tgm_next(&a->tgm); }
+void app_tg_prev(svx_app *a)                 { tgm_prev(&a->tgm); }
+void app_tg_select(svx_app *a, uint32_t tg)  { tgm_select(&a->tgm, tg); }
+void app_tg_index(svx_app *a, int idx)       { tgm_select_index(&a->tgm, idx); }
+void app_toggle_lock(svx_app *a)             { tgm_toggle_lock(&a->tgm); }
+void app_toggle_mute(svx_app *a, uint32_t t) { tgm_toggle_mute(&a->tgm, t); }
+void app_reconnect(svx_app *a)               { rc_reconnect_now(a->rc); }
+void app_quit(svx_app *a)                    { a->quit = 1; }
+int  app_should_quit(const svx_app *a)       { return a->quit; }
+
+void app_toggle_connect(svx_app *a) {
+    if (rc_get_state(a->rc) == RC_IDLE) rc_start(a->rc);
+    else                                rc_stop(a->rc, "disconnected by you");
+}
+
+void app_volume_delta(svx_app *a, int delta) {
+    int v = CLAMP(a->cfg->output_volume_pct + delta, 0, 100);
+    /* The live value lives in the jitter buffer; cfg is const, so keep the
+     * authoritative copy there and mirror it here for the display. */
+    ((svx_config *)a->cfg)->output_volume_pct = v;
+    a->out_muted = 0;
+    if (a->audio_ready) jitter_set_volume(&a->jb, v);
+    notify(a);
+}
+
+void app_toggle_output_mute(svx_app *a) {
+    if (a->out_muted) {
+        a->out_muted = 0;
+        ((svx_config *)a->cfg)->output_volume_pct = a->volume_before_mute;
+    } else {
+        a->volume_before_mute = a->cfg->output_volume_pct;
+        a->out_muted = 1;
+        ((svx_config *)a->cfg)->output_volume_pct = 0;
+    }
+    if (a->audio_ready) jitter_set_volume(&a->jb, a->cfg->output_volume_pct);
+    notify(a);
+}
+
+void app_test_tone(svx_app *a) {
+    /* The point of a test tone is to prove the output path, so force the level
+     * up: leaving it inaudible because the volume happened to be at 5% would
+     * defeat the purpose. */
+    if (!a->audio_ready) return;
+    if (a->cfg->output_volume_pct < 50) {
+        ((svx_config *)a->cfg)->output_volume_pct = 50;
+        a->out_muted = 0;
+        jitter_set_volume(&a->jb, 50);
+    }
+    tx_beep(a, 2);
+    jitter_end_of_stream(&a->jb);   /* open the gate so it actually plays */
+}
+
+/* ----------------------------------------------------------- accessors */
+
+const svx_config *app_config(const svx_app *a) { return a->cfg; }
+rc_client        *app_rc(svx_app *a)           { return a->rc; }
+tg_manager       *app_tgm(svx_app *a)          { return &a->tgm; }
+
+int      app_tx_active(const svx_app *a)    { return a->tx_active; }
+int      app_audio_ready(const svx_app *a)  { return a->audio_ready; }
+int      app_volume(const svx_app *a)       { return a->cfg->output_volume_pct; }
+int      app_output_muted(const svx_app *a) { return a->out_muted; }
+
+int app_tx_available(const svx_app *a) { return !a->no_tx && a->tx_ready; }
+
+uint64_t app_tx_elapsed_ms(const svx_app *a) {
+    return a->tx_active ? now_ms() - a->tx_started_ms : 0;
+}
+
+float app_mic_level(const svx_app *a) {
+    return atomic_load_explicit(&((svx_app *)a)->mic_peak, memory_order_relaxed);
+}
+float app_spk_level(const svx_app *a) {
+    return atomic_load_explicit(&((svx_app *)a)->spk_peak, memory_order_relaxed);
+}
+
+uint32_t    app_jitter_ms(const svx_app *a)    { return a->audio_ready ? jitter_depth_ms(&a->jb) : 0; }
+const char *app_jitter_state(const svx_app *a) { return a->audio_ready ? jitter_state_name(&a->jb) : "off"; }
+
+const char *app_banner(const svx_app *a) { return a->banner[0] ? a->banner : NULL; }
+void app_dismiss_banner(svx_app *a)      { a->banner[0] = '\0'; notify(a); }
+
+/* ------------------------------------------------------------- headless */
+
+static volatile sig_atomic_t g_quit;
+static void on_signal(int sig) { (void)sig; g_quit = 1; }
+
+int run_headless(const svx_config *cfg, int no_tx) {
+    /* No SA_RESTART: poll() should return EINTR so the loop notices. */
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = on_signal;
+    sigaction(SIGINT,  &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
+
+    svx_app *a = app_new(cfg, no_tx);
+    if (!a) { log_err("out of memory"); return 1; }
 
     log_info("svxconnect headless — %s -> %s:%d%s",
              cfg->callsign, cfg->reflector, cfg->port, no_tx ? " (receive only)" : "");
-    log_info("starting on TG %u%s", tgm_selected(&app.tgm),
-             tgm_locked(&app.tgm) ? " (locked)" : "");
 
-    rc_start(app.rc);
-    app.last_report = now_ms();
+    app_start(a);
+    log_info("starting on TG %u%s", tgm_selected(&a->tgm),
+             tgm_locked(&a->tgm) ? " (locked)" : "");
 
-    while (!g_quit && !app.quit) {
+    while (!g_quit && !app_should_quit(a)) {
         uint64_t now = now_ms();
 
         struct pollfd p[10];
-        int n  = rc_poll_fds(app.rc, p, 10);
-
-        int ctl_idx = -1;
-        if (ctl_fd(&app.ctl) >= 0 && n < 10) {
-            ctl_idx = n;
-            p[n].fd = ctl_fd(&app.ctl); p[n].events = POLLIN; p[n].revents = 0;
-            n++;
-        }
-
-        int to = rc_next_timeout_ms(app.rc, now);
-        /* The jitter buffer's state machine wants servicing on roughly a frame
-         * boundary, so never sleep longer than that while audio is running.
-         * While transmitting, poll the capture ring harder still: the device
-         * never wakes us (it may not — see dev.h), so this cadence is what
-         * bounds the extra latency we add on the transmit path. */
-        if (app.audio_ready && to > 20) to = 20;
-        if (app.tx_active   && to > 5)  to = 5;
+        int n  = app_poll_fds(a, p, 10);
+        int to = app_next_timeout_ms(a, now);
 
         int pr = poll(p, (nfds_t)n, to);
         if (pr < 0 && errno != EINTR) {
             log_err("poll failed: %s", strerror(errno));
             break;
         }
-
-        (void)ctl_idx;
-        ctl_drain(&app.ctl);
-
-        now = now_ms();
-        rc_service(app.rc, now);
-        if (app.audio_ready) jitter_tick(&app.jb, now);
-        tgm_tick(&app.tgm, now);
-        tx_pump(&app);
-
-        /* If the link went away mid-over, stop rather than encode into a void. */
-        if (app.tx_active && rc_get_state(app.rc) != RC_CONNECTED)
-            tx_stop(&app, "the connection dropped");
-
-        if (now - app.last_report >= 60000) {
-            app.last_report = now;
-            rc_stats st;
-            rc_get_stats(app.rc, &st);
-            log_info("stats: rx %llu pkt (%d/s), tx %llu pkt, lost %llu (%.1f%%), "
-                     "replayed %llu, bad-auth %llu",
-                     (unsigned long long)st.rx_packets, st.rx_pps,
-                     (unsigned long long)st.tx_packets,
-                     (unsigned long long)st.rx_lost, st.loss_pct,
-                     (unsigned long long)st.rx_replayed,
-                     (unsigned long long)st.rx_auth_fail);
-            if (app.audio_ready) {
-                log_info("audio: %llu frames, %llu concealed, %llu underruns, "
-                         "%llu dropped, %u ms buffered, device underruns %u",
-                         (unsigned long long)app.jb.n_frames,
-                         (unsigned long long)app.jb.n_concealed,
-                         (unsigned long long)app.jb.n_underruns,
-                         (unsigned long long)app.jb.n_dropped,
-                         jitter_depth_ms(&app.jb),
-                         svx_dev_underruns(app.play_dev));
-            }
-        }
+        app_service(a, now_ms());
     }
 
     log_info("shutting down");
-    if (app.tx_active) tx_stop(&app, "shutting down");
-    ctl_close(&app.ctl);
-    rc_stop(app.rc, "quit");
-    rc_free(app.rc);
-    tx_close(&app);
-    audio_stop(&app);
+    app_free(a);
     return 0;
 }

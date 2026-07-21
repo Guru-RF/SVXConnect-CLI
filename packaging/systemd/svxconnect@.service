@@ -1,0 +1,60 @@
+; SVXConnect-CLI — headless reflector node, one instance per config file.
+;
+;   /etc/svxconnect/be.conf   ->   systemctl enable --now svxconnect@be
+;
+; This runs the HEADLESS mode only. The interactive ncurses interface is not a
+; service: it wants a terminal, and systemd has none to give it.
+;
+; See DEPLOY.md for the full setup, including the dedicated user and the
+; permissions the PKI directory needs.
+
+[Unit]
+Description=SVXConnect reflector node (%i)
+Documentation=https://github.com/Guru-RF/SVXConnect-CLI
+After=network-online.target sound.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=svxconnect
+Group=svxconnect
+; audio: needed for playback, and for capture if this node ever transmits
+SupplementaryGroups=audio
+
+ExecStart=/usr/local/bin/svxconnect --headless -c /etc/svxconnect/%i.conf
+
+Restart=on-failure
+RestartSec=5
+; Do not give up: a reflector or a network can be away for a long time and the
+; client's own backoff already keeps the retry rate polite.
+StartLimitIntervalSec=0
+
+; Logs go to the journal — the config's log_file is for interactive use.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=svxconnect@%i
+
+; --- hardening -------------------------------------------------------------
+; A voice client needs the network, a sound device, and its own state. Nothing
+; else, so nothing else is reachable.
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=false          ; false: /dev/snd is required
+DeviceAllow=char-alsa rw
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+
+; Writable state: the log, the control FIFO, and the PKI directory.
+StateDirectory=svxconnect
+ReadWritePaths=/var/lib/svxconnect
+
+[Install]
+WantedBy=multi-user.target
