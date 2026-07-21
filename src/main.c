@@ -12,6 +12,7 @@
 #include "common/util.h"
 #include "headless.h"
 #include "reflector/enroll.h"
+#include "audio/audiotest.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -186,9 +187,10 @@ int main(int argc, char **argv) {
     }
 
     case MODE_LIST_DEVICES:
+        return audio_list_devices(&cfg);
+
     case MODE_AUDIO_TEST:
-        fprintf(stderr, "svxconnect: audio is not implemented yet (milestone M3)\n");
-        return 69;
+        return audio_run_test(&cfg);
 
     case MODE_HEADLESS:
         if (config_validate(&cfg, 0) != 0) {
