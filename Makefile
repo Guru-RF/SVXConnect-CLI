@@ -94,7 +94,7 @@ endif
 OBJ := $(patsubst %.c,$(BUILD)/%.o,$(CSRC)) $(patsubst %.m,$(BUILD)/%.o,$(MSRC))
 DEP := $(OBJ:.o=.d)
 
-.PHONY: all clean install uninstall asan
+.PHONY: all clean install uninstall asan test
 all: $(BUILD)/$(BIN)
 
 $(BUILD)/$(BIN): $(OBJ)
@@ -114,6 +114,22 @@ $(BUILD)/%.o: %.m
 # so relax the warnings for that one translation unit only.
 $(BUILD)/src/audio/dev_miniaudio.o: CFLAGS += -Wno-unused-function -Wno-unused-variable \
                                               -Wno-sign-compare -Wno-unused-but-set-variable
+
+# Unit tests. Only the pure-logic modules are covered: the talkgroup
+# preemption rules, which have no I/O and are where a subtle mistake is both
+# most likely and least visible.
+TEST_OBJ := $(BUILD)/tests/tgtest.o \
+            $(BUILD)/src/tg/tgmanager.o \
+            $(BUILD)/src/common/config.o \
+            $(BUILD)/src/common/log.o \
+            $(BUILD)/src/common/util.o
+
+$(BUILD)/tgtest: $(TEST_OBJ)
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $^ -lm
+
+test: $(BUILD)/tgtest
+	@$(BUILD)/tgtest
 
 asan:
 	$(MAKE) clean

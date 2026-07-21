@@ -11,6 +11,7 @@
 #include "common/util.h"
 #include "ctl/ctlfifo.h"
 #include "reflector/client.h"
+#include "tg/tgmanager.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -53,6 +54,7 @@ typedef struct {
     uint32_t          busy_tg;
     char              busy_call[64];
 
+    tg_manager        tgm;
     ctl_fifo          ctl;
     int               quit;
     uint64_t          last_report;
@@ -71,6 +73,7 @@ static void hl_state(void *u, rc_state st, const char *detail) {
         log_info("client id %u, %d nodes, %s:%u",
                  rc_client_id(a->rc), rc_node_count(a->rc),
                  rc_host(a->rc), rc_port(a->rc));
+        tgm_after_connect(&a->tgm);
     } else if (a->audio_ready) {
         /* Whatever was queued belongs to a connection that no longer exists. */
         jitter_flush(&a->jb);
@@ -84,6 +87,7 @@ static void hl_talker_start(void *u, uint32_t tg, const char *call) {
         a->busy_tg = tg;
         snprintf(a->busy_call, sizeof(a->busy_call), "%s", call);
     }
+    tgm_on_talker_start(&a->tgm, tg, call);
 }
 
 static void hl_talker_stop(void *u, uint32_t tg, const char *call) {
@@ -100,10 +104,9 @@ static void hl_talker_stop(void *u, uint32_t tg, const char *call) {
         a->busy_tg = 0;
         a->busy_call[0] = '\0';
     }
-    if (a->audio_ready) {
-        if (a->cfg->tail_trim_ms > 0) jitter_trim_tail(&a->jb, a->cfg->tail_trim_ms);
-        jitter_end_of_stream(&a->jb);
-    }
+    /* The manager owns the roger beep, the tail trim and the linger window. */
+    tgm_on_talker_stop(&a->tgm, tg, call);
+    if (a->audio_ready) jitter_end_of_stream(&a->jb);
 }
 
 static void hl_audio(void *u, const uint8_t *opus, size_t len, int gap) {
@@ -221,7 +224,7 @@ static int tx_start(hl_app *a) {
         rc_reconnect_now(a->rc);
         return -1;
     }
-    if (rc_current_tg(a->rc) == 0) {
+    if (tgm_selected(&a->tgm) == 0) {
         log_warn("PTT refused: no talkgroup selected");
         tx_beep(a, 3);
         return -1;
@@ -258,7 +261,7 @@ static int tx_start(hl_app *a) {
     a->tx_active     = 1;
     a->tx_started_ms = now_ms();
     a->tx_frames     = 0;
-    log_info("TX ON   TG %u", rc_current_tg(a->rc));
+    log_info("TX ON   TG %u", tgm_selected(&a->tgm));
     return 0;
 }
 
@@ -375,6 +378,31 @@ static void tx_close(hl_app *a) {
     codec_close(a->tx_codec);   a->tx_codec = NULL;
 }
 
+/* -------------------------------------------- talkgroup manager glue */
+
+static void tgm_do_select(void *u, uint32_t tg, int gate) {
+    hl_app *a = u;
+    if (a->tx_active) tx_stop(a, "talkgroup changed");
+    if (gate && a->audio_ready) jitter_flush(&a->jb);
+    a->busy_tg = 0;
+    a->busy_call[0] = '\0';
+    rc_select_tg(a->rc, tg);
+}
+
+static void tgm_do_monitor(void *u, const uint32_t *ids, size_t n) {
+    hl_app *a = u;
+    rc_set_monitor(a->rc, ids, n);
+}
+
+static void tgm_do_beep(void *u, int n) { tx_beep((hl_app *)u, n); }
+
+static void tgm_do_tail(void *u, int ms) {
+    hl_app *a = u;
+    if (a->audio_ready) jitter_trim_tail(&a->jb, ms);
+}
+
+static void tgm_do_changed(void *u) { (void)u; }
+
 /* ------------------------------------------------------ control FIFO */
 
 static void ctl_ptt(void *u, ctl_tristate v) {
@@ -386,27 +414,21 @@ static void ctl_ptt(void *u, ctl_tristate v) {
 
 static void ctl_tg(void *u, ctl_tg_kind kind, uint32_t tg) {
     hl_app *a = u;
-    const svx_config *cfg = a->cfg;
+    if      (kind == CTL_TG_NEXT) tgm_next(&a->tgm);
+    else if (kind == CTL_TG_PREV) tgm_prev(&a->tgm);
+    else                          tgm_select(&a->tgm, tg);
+    log_info("TG %u", tgm_selected(&a->tgm));
+}
 
-    if (a->tx_active) tx_stop(a, "talkgroup changed");
+static void ctl_lock(void *u, ctl_tristate v) {
+    hl_app *a = u;
+    if (v == CTL_TOGGLE) tgm_toggle_lock(&a->tgm);
+    else                 tgm_set_lock(&a->tgm, v == CTL_ON);
+}
 
-    uint32_t want = tg;
-    if (kind != CTL_TG_ABS) {
-        if (cfg->n_switchable == 0) return;
-        uint32_t cur = rc_current_tg(a->rc);
-        int idx = -1;
-        for (int i = 0; i < cfg->n_switchable; i++)
-            if (cfg->switchable[i].id == cur) { idx = i; break; }
-        int step = (kind == CTL_TG_NEXT) ? 1 : -1;
-        idx = (idx < 0) ? 0 : (idx + step + cfg->n_switchable) % cfg->n_switchable;
-        want = cfg->switchable[idx].id;
-    }
-
-    if (want == rc_current_tg(a->rc)) return;
-    if (a->audio_ready) jitter_flush(&a->jb);
-    a->busy_tg = 0; a->busy_call[0] = '\0';
-    rc_select_tg(a->rc, want);
-    log_info("TG %u", want);
+static void ctl_mute(void *u, uint32_t tg, int mute) {
+    hl_app *a = u;
+    if (tgm_is_muted(&a->tgm, tg) != mute) tgm_toggle_mute(&a->tgm, tg);
 }
 
 static void ctl_volume(void *u, int pct) {
@@ -419,8 +441,9 @@ static void ctl_status(void *u) {
     hl_app *a = u;
     rc_stats st;
     rc_get_stats(a->rc, &st);
-    log_info("status: %s, TG %u, %s, rx %llu pkt, lost %.1f%%, buffered %u ms",
-             rc_state_name(rc_get_state(a->rc)), rc_current_tg(a->rc),
+    log_info("status: %s, TG %u%s, %s, rx %llu pkt, lost %.1f%%, buffered %u ms",
+             rc_state_name(rc_get_state(a->rc)), tgm_selected(&a->tgm),
+             tgm_locked(&a->tgm) ? " LOCKED" : "",
              a->tx_active ? "TRANSMITTING" : "idle",
              (unsigned long long)st.rx_packets, st.loss_pct,
              a->audio_ready ? jitter_depth_ms(&a->jb) : 0);
@@ -465,33 +488,28 @@ int run_headless(const svx_config *cfg, int no_tx) {
         .user      = &app,
         .on_ptt    = ctl_ptt,
         .on_tg     = ctl_tg,
+        .on_lock   = ctl_lock,
+        .on_mute   = ctl_mute,
         .on_volume = ctl_volume,
         .on_status = ctl_status,
         .on_quit   = ctl_quit,
     };
     ctl_open(&app.ctl, cfg->ctl_fifo, &ccb);
 
-    /* Watch everything the config names, switchable or monitored — arrowing
-     * onto a talkgroup you cannot hear would be no use. */
-    uint32_t mon[SVX_MAX_TG * 2];
-    size_t   n_mon = 0;
-    for (int i = 0; i < cfg->n_monitored && n_mon < sizeof(mon) / sizeof(mon[0]); i++)
-        mon[n_mon++] = cfg->monitored[i].id;
-    for (int i = 0; i < cfg->n_switchable && n_mon < sizeof(mon) / sizeof(mon[0]); i++) {
-        int dup = 0;
-        for (size_t j = 0; j < n_mon; j++) if (mon[j] == cfg->switchable[i].id) { dup = 1; break; }
-        if (!dup) mon[n_mon++] = cfg->switchable[i].id;
-    }
-    rc_set_monitor(app.rc, mon, n_mon);
-
-    uint32_t start_tg = (uint32_t)cfg->default_tg;
-    if (start_tg == 0 && cfg->n_switchable > 0) start_tg = cfg->switchable[0].id;
-    rc_select_tg(app.rc, start_tg);
+    tgm_callbacks tcb = {
+        .user        = &app,
+        .select_tg   = tgm_do_select,
+        .set_monitor = tgm_do_monitor,
+        .beep        = tgm_do_beep,
+        .changed     = tgm_do_changed,
+        .tail_trim   = tgm_do_tail,
+    };
+    tgm_init(&app.tgm, cfg, &tcb);
 
     log_info("svxconnect headless — %s -> %s:%d%s",
              cfg->callsign, cfg->reflector, cfg->port, no_tx ? " (receive only)" : "");
-    log_info("monitoring %zu talkgroup%s, starting on TG %u",
-             n_mon, n_mon == 1 ? "" : "s", start_tg);
+    log_info("starting on TG %u%s", tgm_selected(&app.tgm),
+             tgm_locked(&app.tgm) ? " (locked)" : "");
 
     rc_start(app.rc);
     app.last_report = now_ms();
@@ -530,6 +548,7 @@ int run_headless(const svx_config *cfg, int no_tx) {
         now = now_ms();
         rc_service(app.rc, now);
         if (app.audio_ready) jitter_tick(&app.jb, now);
+        tgm_tick(&app.tgm, now);
         tx_pump(&app);
 
         /* If the link went away mid-over, stop rather than encode into a void. */
