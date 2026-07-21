@@ -87,8 +87,11 @@ svxconnect --enroll     # send a CSR, wait for the sysop to sign it
 svxconnect              # go
 ```
 
-`svxconnect --dump-config` prints every setting with its resolved value — the
-quickest way to see what the program actually read.
+The config is looked for at `$SVXCONNECT_CONF`, then
+`~/.config/svxconnect/svxconnect.conf` (or `$XDG_CONFIG_HOME/svxconnect/…`),
+then `/etc/svxconnect/svxconnect.conf` — or pass one explicitly with
+`svxconnect -c <file>`. If none is found, svxconnect prints the exact path to
+create. `svxconnect --dump-config` prints every setting with its resolved value.
 
 ## Configuration
 

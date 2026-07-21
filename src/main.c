@@ -32,6 +32,43 @@ enum {
     MODE_DUMP_CONFIG
 };
 
+/* Print, after a validation failure, where the configuration is expected and
+ * how to create or fix it. `resolved` is the path we looked at — which, when no
+ * file exists, is still the path we would like the user to create (see
+ * config_default_path). */
+static void config_help(const char *resolved) {
+    int exists = (access(resolved, R_OK) == 0);
+
+    if (exists) {
+        fprintf(stderr,
+            "\nsvxconnect: the configuration at\n"
+            "              %s\n"
+            "            is incomplete — see the errors above. Edit that file,\n"
+            "            or start fresh from the example:\n"
+            "              https://github.com/Guru-RF/SVXConnect-CLI/blob/main/example.conf\n",
+            resolved);
+        return;
+    }
+
+    /* Derive the directory to create from the path. */
+    char dir[1024];
+    snprintf(dir, sizeof(dir), "%s", resolved);
+    char *slash = strrchr(dir, '/');
+    if (slash) *slash = '\0'; else snprintf(dir, sizeof(dir), ".");
+
+    fprintf(stderr,
+        "\nsvxconnect: no configuration file found. Create one at:\n"
+        "              %s\n\n"
+        "            mkdir -p %s\n"
+        "            cp <example.conf> %s\n"
+        "            $EDITOR %s\n\n"
+        "            The example is bundled with the install (Homebrew:\n"
+        "            $(brew --prefix)/share/svxconnect/example.conf) or online:\n"
+        "              https://github.com/Guru-RF/SVXConnect-CLI/blob/main/example.conf\n\n"
+        "            Or point at a config explicitly with:  svxconnect -c <file>\n",
+        resolved, dir, resolved, resolved);
+}
+
 static void usage(FILE *f) {
     fprintf(f,
 "svxconnect " SVX_VERSION " — terminal client for SvxLink reflectors\n"
@@ -180,7 +217,7 @@ int main(int argc, char **argv) {
         return 0;
 
     case MODE_ENROLL: {
-        if (config_validate(&cfg, 1) != 0) return 1;
+        if (config_validate(&cfg, 1) != 0) { config_help(resolved); return 1; }
         int rc = enroll_run(&cfg, 30);
         return rc == 0 ? 0 : (rc > 0 ? 1 : 2);
     }
@@ -193,9 +230,7 @@ int main(int argc, char **argv) {
 
     case MODE_HEADLESS:
         if (config_validate(&cfg, 0) != 0) {
-            fprintf(stderr, "\nsvxconnect: fix the configuration and try again.\n"
-                            "            Start from the example: %s\n",
-                    "https://github.com/Guru-RF/SVXConnect-CLI/blob/main/example.conf");
+            config_help(resolved);
             return 1;
         }
         return run_headless(&cfg, no_tx);
@@ -203,9 +238,7 @@ int main(int argc, char **argv) {
     case MODE_TUI:
     default:
         if (config_validate(&cfg, 0) != 0) {
-            fprintf(stderr, "\nsvxconnect: fix the configuration and try again.\n"
-                            "            Start from the example: %s\n",
-                    "https://github.com/Guru-RF/SVXConnect-CLI/blob/main/example.conf");
+            config_help(resolved);
             return 1;
         }
         {
