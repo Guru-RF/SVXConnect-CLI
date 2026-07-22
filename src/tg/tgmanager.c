@@ -301,9 +301,15 @@ void tgm_on_talker_stop(tg_manager *m, uint32_t tg, const char *call) {
 }
 
 void tgm_tick(tg_manager *m, uint64_t now) {
+    /* Timestamps here are set from now_ms(); guard every elapsed-time
+     * subtraction against a `now` that is somehow behind one of them, so an
+     * unsigned underflow can never turn "0 ms ago" into ~49 days and fire the
+     * prune or the idle-drop by accident. */
+    #define TGM_SINCE(ts) ((now >= (ts)) ? now - (ts) : 0)
+
     /* Drop talkers the server never told us had stopped. */
     for (int i = m->n_active - 1; i >= 0; i--) {
-        if (now - m->active[i].start_ms > TGM_PRUNE_MS) {
+        if (TGM_SINCE(m->active[i].start_ms) > TGM_PRUNE_MS) {
             log_dbg("pruning stale talker %s on TG %u", m->active[i].call, m->active[i].tg);
             active_erase(m, i);
         }
@@ -316,7 +322,9 @@ void tgm_tick(tg_manager *m, uint64_t now) {
 
     if (m->locked || m->selected == 0 || m->n_active > 0) return;
     if (m->cfg->idle_seconds <= 0) return;
-    if (now - m->last_traffic < (uint64_t)m->cfg->idle_seconds * 1000) return;
+    if (TGM_SINCE(m->last_traffic) < (uint64_t)m->cfg->idle_seconds * 1000) return;
+
+    #undef TGM_SINCE
 
     /* Nothing anywhere for idle_seconds: fall back to monitor-only so we are
      * not sitting on a talkgroup we are not using. */

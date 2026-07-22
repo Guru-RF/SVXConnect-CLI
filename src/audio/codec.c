@@ -171,6 +171,20 @@ float codec_peak(const int16_t *pcm, int n) {
     return (float)m / 32768.0f;
 }
 
+void codec_apply_gain_db(int16_t *pcm, int n, float gain_db) {
+    if (gain_db == 0.0f) return;
+
+    float       g    = powf(10.0f, gain_db / 20.0f);   /* dB -> linear */
+    const float CEIL = 29000.0f;                        /* matches the AGC limiter */
+    for (int i = 0; i < n; i++) {
+        /* Soft-limit throughout: at these low/mid levels tanh(x) ~= x, so a
+         * modest boost stays transparent, while a heavy one rounds its peaks
+         * rather than flat-topping them. */
+        float o = CEIL * tanhf((float)pcm[i] * g / CEIL);
+        pcm[i] = clamp16(o);
+    }
+}
+
 void codec_apply_volume(int16_t *pcm, int n, int volume_pct) {
     if (volume_pct == 100) return;
     if (volume_pct <= 0) { memset(pcm, 0, (size_t)n * sizeof(int16_t)); return; }

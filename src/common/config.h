@@ -59,6 +59,7 @@ typedef struct {
     int      output_volume_pct;
     int      mic_agc;
     int      mic_agc_target_pct;
+    int      mic_gain;            /* fixed input boost in dB, applied before AGC */
     int      jitter_ms;
     int      tail_trim_ms;
     int      roger_beep;

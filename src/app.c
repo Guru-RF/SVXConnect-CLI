@@ -332,6 +332,11 @@ static void tx_pump(svx_app *a) {
         if (svx_ring_read(&a->cap_ring, a->tx_pcm, SVX_FRAME) != SVX_FRAME) break;
 
         codec_dcblock(a->tx_codec, a->tx_pcm, SVX_FRAME);
+        /* Fixed pre-gain first: it lifts a quiet mic above the AGC's noise gate
+         * (and is the only boost when the AGC is off). DC is removed before it
+         * so the gain does not amplify any offset. */
+        if (a->cfg->mic_gain != 0)
+            codec_apply_gain_db(a->tx_pcm, SVX_FRAME, (float)a->cfg->mic_gain);
         codec_agc(a->tx_codec, a->tx_pcm, SVX_FRAME);
 
         uint8_t opus[SVX_MAX_OPUS];
@@ -622,7 +627,12 @@ void app_service(svx_app *a, uint64_t now) {
 
     rc_service(a->rc, now);
     if (a->audio_ready) jitter_tick(&a->jb, now);
-    tgm_tick(&a->tgm, now);
+    /* Re-sample the clock: rc_service() and the callbacks it fires (talker
+     * events, connect) stamp timestamps with a fresh now_ms(), which is LATER
+     * than the `now` sampled at entry. Passing the stale `now` to tgm_tick made
+     * `now - last_traffic` underflow and the idle-drop fire the instant we
+     * connected or a talker stopped. */
+    tgm_tick(&a->tgm, now_ms());
     tx_pump(a);
 
     /* If the link went away mid-over, stop rather than encode into a void. */

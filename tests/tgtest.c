@@ -267,6 +267,27 @@ static void t_idle_drops_to_monitor_only(void) {
           "should have dropped to monitor-only, still on %u", tgm_selected(&m));
 }
 
+static void t_idle_no_underflow_on_stale_now(void) {
+    printf("idle: a 'now' behind last_traffic must NOT trigger the idle drop\n");
+    /* Regression: app_service samples `now`, then rc_service's callbacks stamp
+     * last_traffic with a LATER now_ms(), so tgm_tick saw last_traffic > now.
+     * The unsigned subtraction underflowed to ~49 days and dropped us to
+     * monitor-only the instant we connected or a talker stopped. */
+    svx_config cfg; setup(&cfg, "8", "8");
+    cfg.idle_seconds = 60;
+    tg_manager m; tgm_init(&m, &cfg, &CB);
+    tgm_select(&m, 8);
+    m.linger_until = 0;
+
+    uint64_t now = now_ms();
+    m.last_traffic = now + 1000;          /* last_traffic is 1s in the future */
+    reset_spy();
+    tgm_tick(&m, now);                    /* now < last_traffic */
+    CHECK(tgm_selected(&m) == 8,
+          "a stale 'now' must not underflow into an idle drop, dropped to %u",
+          tgm_selected(&m));
+}
+
 static void t_monitor_always_follows_select(void) {
     printf("protocol: every select is followed by a monitor set\n");
     svx_config cfg; setup(&cfg, "8, 1745", "8, 1745");
@@ -309,6 +330,7 @@ int main(void) {
     t_tiebreak_is_deterministic();
     t_mute_removes_from_monitor();
     t_idle_drops_to_monitor_only();
+    t_idle_no_underflow_on_stale_now();
     t_monitor_always_follows_select();
     t_arrows_wrap();
 

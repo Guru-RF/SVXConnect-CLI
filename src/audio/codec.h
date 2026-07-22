@@ -63,4 +63,10 @@ float codec_peak(const int16_t *pcm, int n);
 /* Apply a linear volume in place, 0..100 percent, with a soft ceiling. */
 void codec_apply_volume(int16_t *pcm, int n, int volume_pct);
 
+/* Apply a fixed gain in dB in place, with the same soft tanh ceiling the AGC
+ * uses so a large boost tames its peaks instead of hard-clipping. Meant as a
+ * mic pre-gain ahead of the AGC — it lifts a quiet input above the AGC's noise
+ * gate, and is the only mic boost when the AGC is off. 0 dB is a no-op. */
+void codec_apply_gain_db(int16_t *pcm, int n, float gain_db);
+
 #endif

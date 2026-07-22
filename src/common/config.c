@@ -62,6 +62,7 @@ static const cfg_desc DESC[] = {
     { "output_volume_pct",   CT_INT,    F(output_volume_pct), 0,                   0, 100,        NULL },
     { "mic_agc",             CT_BOOL,   F(mic_agc),           0,                   0, 0,          NULL },
     { "mic_agc_target_pct",  CT_INT,    F(mic_agc_target_pct),0,                   5, 95,         NULL },
+    { "mic_gain",            CT_INT,    F(mic_gain),          0,                 -20, 40,         NULL },
     { "jitter_ms",           CT_INT,    F(jitter_ms),         0,                  40, 300,        NULL },
     { "tail_trim_ms",        CT_INT,    F(tail_trim_ms),      0,                   0, 1000,       NULL },
     { "roger_beep",          CT_BOOL,   F(roger_beep),        0,                   0, 0,          NULL },
@@ -115,6 +116,7 @@ void config_defaults(svx_config *cfg) {
     cfg->output_volume_pct   = 100;
     cfg->mic_agc             = 1;
     cfg->mic_agc_target_pct  = 30;
+    cfg->mic_gain            = 0;
     cfg->jitter_ms           = 80;
     cfg->tail_trim_ms        = 0;
     cfg->roger_beep          = 1;
