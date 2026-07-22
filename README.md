@@ -63,13 +63,11 @@ maintain:
 
 ```sh
 brew tap guru-rf/svxconnect https://github.com/Guru-RF/SVXConnect-CLI
-brew install --HEAD svxconnect
+brew install svxconnect
 ```
 
-`--HEAD` builds from the `main` branch; once a version is tagged and released
-you can drop it and `brew install svxconnect` for the stable build. If Homebrew
-refuses the tap as an untrusted third party, run `brew trust guru-rf/svxconnect`
-and retry.
+If Homebrew refuses the tap as an untrusted third party, run
+`brew trust guru-rf/svxconnect` and retry.
 
 ### Linux — Raspberry Pi OS, Debian, Ubuntu
 
