@@ -42,6 +42,10 @@ typedef struct {
 svx_app *app_new(const svx_config *cfg, int no_tx);
 void     app_free(svx_app *a);
 
+/* Label this process in the exported status file: "cli" | "headless" | "gui".
+ * Defaults to "cli". Set it before app_start() so the first snapshot is right. */
+void     app_set_owner_kind(svx_app *a, const char *kind);
+
 /* Open the audio devices and the control FIFO, then start connecting. */
 void     app_start(svx_app *a);
 
@@ -60,6 +64,13 @@ void     app_tg_index(svx_app *a, int idx);      /* the 1..9 keys */
 void     app_toggle_lock(svx_app *a);
 void     app_toggle_mute(svx_app *a, uint32_t tg);
 void     app_volume_delta(svx_app *a, int delta);
+void     app_set_volume(svx_app *a, int pct);    /* absolute 0..100 */
+
+/* Switch an audio device at runtime, re-opening it. "" or "default" selects the
+ * system default. The desktop GUI's device picker uses these; the terminal
+ * client has no runtime switch (it tells you to set the key in the config). */
+void     app_set_input_device(svx_app *a, const char *dev);
+void     app_set_output_device(svx_app *a, const char *dev);
 void     app_toggle_output_mute(svx_app *a);
 void     app_test_tone(svx_app *a);
 void     app_reconnect(svx_app *a);

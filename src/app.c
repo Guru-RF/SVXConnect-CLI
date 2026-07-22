@@ -8,6 +8,7 @@
 #include "audio/jitter.h"
 #include "common/log.h"
 #include "common/ring.h"
+#include "common/status.h"
 #include "common/util.h"
 #include "ctl/ctlfifo.h"
 #include "reflector/client.h"
@@ -50,6 +51,13 @@ struct svx_app {
     ctl_fifo          ctl;
     int               quit;
     uint64_t          last_report;
+
+    /* Status export for a companion panel widget. owner_kind names which front
+     * end we are; the last written line and its time throttle the writes to
+     * "on change, plus a 1 Hz heartbeat so the reader can trust the mtime". */
+    char              owner_kind[16];
+    char              status_line[256];
+    uint64_t          last_status;
 
     /* Output mute remembers the level it was at, so unmuting restores it
      * rather than jumping to some default. */
@@ -531,6 +539,41 @@ void app_set_observer(svx_app *a, void (*fn)(void *), void *user) {
     a->observer_user = user;
 }
 
+void app_set_owner_kind(svx_app *a, const char *kind) {
+    if (!a || !kind || !*kind) return;
+    snprintf(a->owner_kind, sizeof(a->owner_kind), "%s", kind);
+}
+
+/* Write the status snapshot, throttled: immediately when the meaningful state
+ * changed, otherwise at most once a second to keep the file's mtime fresh so a
+ * reader can tell a live client from a crashed one. Cheap enough to call every
+ * service tick — the string is short and usually identical to the last. */
+static void status_export(svx_app *a) {
+    if (!a->cfg->status_file[0]) return;    /* export disabled */
+
+    svx_status s = {
+        .owner     = a->owner_kind[0] ? a->owner_kind : "cli",
+        .conn      = rc_state_name(rc_get_state(a->rc)),
+        .callsign  = a->cfg->callsign,
+        .reflector = a->cfg->reflector,
+        .tg        = tgm_selected(&a->tgm),
+        .locked    = tgm_locked(&a->tgm),
+        .tx        = a->tx_active,
+        .pid       = (long)getpid(),
+    };
+
+    char line[256];
+    svx_status_format(line, sizeof(line), &s);
+
+    uint64_t now = now_ms();
+    int changed = strcmp(line, a->status_line) != 0;
+    if (!changed && now - a->last_status < 1000) return;
+
+    svx_status_write(a->cfg->status_file, &s);
+    snprintf(a->status_line, sizeof(a->status_line), "%s", line);
+    a->last_status = now;
+}
+
 /* ------------------------------------------------------------- lifetime */
 
 svx_app *app_new(const svx_config *cfg, int no_tx) {
@@ -541,6 +584,7 @@ svx_app *app_new(const svx_config *cfg, int no_tx) {
     a->no_tx    = no_tx;
     a->out_muted = 0;
     a->volume_before_mute = cfg->output_volume_pct;
+    snprintf(a->owner_kind, sizeof(a->owner_kind), "cli");
 
     rc_callbacks cb = {
         .user            = a,
@@ -586,10 +630,12 @@ void app_start(svx_app *a) {
 
     rc_start(a->rc);
     a->last_report = now_ms();
+    status_export(a);       /* publish an initial snapshot right away */
 }
 
 void app_free(svx_app *a) {
     if (!a) return;
+    svx_status_clear(a->cfg->status_file);   /* no owner running now */
     if (a->tx_active) tx_stop(a, "shutting down");
     ctl_close(&a->ctl);
     if (a->rc) { rc_stop(a->rc, "quit"); rc_free(a->rc); }
@@ -639,6 +685,10 @@ void app_service(svx_app *a, uint64_t now) {
     if (a->tx_active && rc_get_state(a->rc) != RC_CONNECTED)
         tx_stop(a, "the connection dropped");
 
+    /* Publish state for the panel widget. Self-throttling; catches connection,
+     * talkgroup and PTT changes that reach here via rc_service and tx_pump. */
+    status_export(a);
+
     if (now - a->last_report >= 60000) {
         a->last_report = now;
         rc_stats st;
@@ -681,7 +731,11 @@ void app_toggle_connect(svx_app *a) {
 }
 
 void app_volume_delta(svx_app *a, int delta) {
-    int v = CLAMP(a->cfg->output_volume_pct + delta, 0, 100);
+    app_set_volume(a, a->cfg->output_volume_pct + delta);
+}
+
+void app_set_volume(svx_app *a, int pct) {
+    int v = CLAMP(pct, 0, 100);
     /* The live value lives in the jitter buffer; cfg is const, so keep the
      * authoritative copy there and mirror it here for the display. */
     ((svx_config *)a->cfg)->output_volume_pct = v;
@@ -700,6 +754,32 @@ void app_toggle_output_mute(svx_app *a) {
         ((svx_config *)a->cfg)->output_volume_pct = 0;
     }
     if (a->audio_ready) jitter_set_volume(&a->jb, a->cfg->output_volume_pct);
+    notify(a);
+}
+
+void app_set_input_device(svx_app *a, const char *dev) {
+    if (a->no_tx) return;                 /* receive-only: nothing to open */
+    if (a->tx_active) tx_stop(a, "input device changed");
+    tx_close(a);
+    snprintf(((svx_config *)a->cfg)->input_device,
+             sizeof(a->cfg->input_device), "%s", (dev && *dev) ? dev : "default");
+    tx_open(a);
+    log_info("input device -> %s", a->cfg->input_device);
+    notify(a);
+}
+
+void app_set_output_device(svx_app *a, const char *dev) {
+    /* The capture device shares the audio context that audio_stop() tears down,
+     * so close it first and re-open it afterwards. */
+    int had_tx = a->tx_ready;
+    if (a->tx_active) tx_stop(a, "output device changed");
+    if (had_tx) tx_close(a);
+    audio_stop(a);
+    snprintf(((svx_config *)a->cfg)->output_device,
+             sizeof(a->cfg->output_device), "%s", (dev && *dev) ? dev : "default");
+    audio_start(a);
+    if (had_tx) tx_open(a);
+    log_info("output device -> %s", a->cfg->output_device);
     notify(a);
 }
 
@@ -762,6 +842,7 @@ int run_headless(const svx_config *cfg, int no_tx) {
 
     svx_app *a = app_new(cfg, no_tx);
     if (!a) { log_err("out of memory"); return 1; }
+    app_set_owner_kind(a, "headless");
 
     log_info("svxconnect headless — %s -> %s:%d%s",
              cfg->callsign, cfg->reflector, cfg->port, no_tx ? " (receive only)" : "");

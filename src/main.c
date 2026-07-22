@@ -5,6 +5,7 @@
  * Released under the MIT License; see LICENSE.
  */
 #include "common/config.h"
+#include "common/lock.h"
 #include "common/log.h"
 #include "common/pki.h"
 #include "common/util.h"
@@ -91,6 +92,30 @@ static int require_enrolled(const svx_config *cfg) {
         "            reflector operator to approve it; then start svxconnect again.\n",
         cfg->callsign, cfg->pki_dir, cfg->reflector);
     return 1;
+}
+
+/* Take the shared run lock before owning the reflector connection. Only one
+ * client — this CLI (TUI or headless) or the desktop GUI — may be connected at
+ * once, so if the lock is held we name the holder and refuse rather than fight
+ * over the same certificate and node id. Returns 0 when acquired. */
+static int acquire_run_lock(const svx_config *cfg, const char *kind) {
+    int r = svx_lock_acquire(cfg->lock_file, kind);
+    if (r == 0) return 0;
+
+    if (r == -1) {
+        char who[16] = "";
+        long pid = 0;
+        svx_lock_who(cfg->lock_file, who, sizeof(who), &pid);
+        fprintf(stderr,
+            "\nsvxconnect: already running as '%s' (pid %ld).\n"
+            "            Only one client may hold the reflector connection at a time —\n"
+            "            the terminal client and the desktop GUI share this lock.\n"
+            "            Quit that one first. (lock: %s)\n",
+            who[0] ? who : "svxconnect", pid, cfg->lock_file);
+    } else {
+        fprintf(stderr, "svxconnect: cannot create lock file %s\n", cfg->lock_file);
+    }
+    return -1;
 }
 
 static void usage(FILE *f) {
@@ -258,7 +283,12 @@ int main(int argc, char **argv) {
             return 1;
         }
         if (require_enrolled(&cfg) != 0) return 4;
-        return run_headless(&cfg, no_tx);
+        if (acquire_run_lock(&cfg, "headless") != 0) return 5;
+        {
+            int rc = run_headless(&cfg, no_tx);
+            svx_lock_release();
+            return rc;
+        }
 
     case MODE_TUI:
     default:
@@ -267,11 +297,14 @@ int main(int argc, char **argv) {
             return 1;
         }
         if (require_enrolled(&cfg) != 0) return 4;
+        if (acquire_run_lock(&cfg, "cli") != 0) return 5;
         {
             svx_app *app = app_new(&cfg, no_tx);
-            if (!app) { fprintf(stderr, "svxconnect: out of memory\n"); return 1; }
+            if (!app) { svx_lock_release(); fprintf(stderr, "svxconnect: out of memory\n"); return 1; }
+            app_set_owner_kind(app, "cli");
             int rc = ui_run(app);
             app_free(app);
+            svx_lock_release();
             return rc;
         }
     }

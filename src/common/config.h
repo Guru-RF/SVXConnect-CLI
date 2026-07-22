@@ -79,6 +79,13 @@ typedef struct {
     int      show_log_pane;
     char     log_file[512];
     char     log_level[16];
+
+    /* ---- runtime coordination ----
+     * The run lock excludes a second connected client (the CLI and the desktop
+     * GUI share it); the status file is a snapshot a panel widget reads. Both
+     * default under the state dir; "" disables the status export. */
+    char     lock_file[512];
+    char     status_file[512];
 } svx_config;
 
 /* Populate with defaults. Never fails. */

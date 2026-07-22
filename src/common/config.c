@@ -77,6 +77,9 @@ static const cfg_desc DESC[] = {
     { "show_log_pane",       CT_BOOL,   F(show_log_pane),     0,                   0, 0,          NULL },
     { "log_file",            CT_PATH,   F(log_file),          0,                   0, 0,          NULL },
     { "log_level",           CT_ENUM,   F(log_level),         0,                   0, 0,          "err|warn|info|debug" },
+
+    { "lock_file",           CT_PATH,   F(lock_file),         0,                   0, 0,          NULL },
+    { "status_file",         CT_PATH,   F(status_file),       0,                   0, 0,          NULL },
 };
 
 #define N_DESC ((int)(sizeof(DESC) / sizeof(DESC[0])))
@@ -131,6 +134,9 @@ void config_defaults(svx_config *cfg) {
     cfg->show_log_pane       = 0;
     snprintf(cfg->log_file, sizeof(cfg->log_file), "%s/svxconnect.log", state);
     snprintf(cfg->log_level, sizeof(cfg->log_level), "info");
+
+    snprintf(cfg->lock_file,   sizeof(cfg->lock_file),   "%s/svxconnect.lock", state);
+    snprintf(cfg->status_file, sizeof(cfg->status_file), "%s/status", state);
 }
 
 /* ------------------------------------------------------------------ paths */
