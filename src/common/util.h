@@ -67,7 +67,7 @@ int  str_ieq(const char *a, const char *b);
 /* Expand a leading "~/" to $HOME. Always NUL-terminates dst. Returns dst. */
 char *path_expand(char *dst, size_t cap, const char *src);
 
-/* Strip an SSID suffix: "ON3URE-7" -> "ON3URE". Also uppercases. Used to
+/* Strip an SSID suffix: "ON6URE-7" -> "ON6URE". Also uppercases. Used to
  * compare talker callsigns, which the reflector may or may not decorate. */
 void call_strip_ssid(char *dst, size_t cap, const char *src);
 

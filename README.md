@@ -9,15 +9,16 @@ and mobile apps: connect to a reflector, monitor a set of talkgroups, switch
 between them with the arrow keys, and transmit — all from an SSH session or a
 terminal window.
 
-> **Status: in development, but it works on the air.** The reflector client,
-> certificate enrolment, audio in both directions and the talkgroup manager are
-> all done and verified against a live reflector — a full transmit/receive
-> round-trip through a parrot talkgroup decodes correctly. The ncurses
-> interface is the last piece; until it lands, use `--headless` plus the
-> control FIFO. See [Roadmap](#roadmap).
+> **Status: working, and on the air.** The reflector client, certificate
+> enrolment, audio both ways, the talkgroup manager and the ncurses interface
+> are all done and verified against a live reflector — including a full
+> transmit/receive round-trip through a parrot talkgroup. `make test` runs 40
+> unit checks (talkgroup preemption and crypto/replay); the build is clean on
+> clang and gcc and passes AddressSanitizer, ThreadSanitizer and a leak check.
+> There is also a `--headless` mode for unattended nodes. See [Roadmap](#roadmap).
 
 ```
-┌─ SVXConnect  ON3URE ────────────────────── be.svx.link:5300  ID 42  nodes 7 ── 20:14:07 ─┐
+┌─ SVXConnect  ON6URE ────────────────────── be.svx.link:5300  ID 42  nodes 7 ── 20:14:07 ─┐
 │ ● Connected      RX  50 p/s   TX   0 p/s   loss 0.0%   JO11ug Gent        cert ok 2027-04│
 ├──────────────────────┬───────────────────────────────────────────────────────────────────┤
 │ TG 8            LOCK │ ACTIVE                                                            │
@@ -34,7 +35,7 @@ terminal window.
 ├──────────────────────┴───────────────────────────────────────────────────────────────────┤
 │                            ▌  SPACE = TRANSMIT  ▌   idle                                 │
 ├──────────────────────────────────────────────────────────────────────────────────────────┤
-│ ←/→ tg   ↑ lock   SPACE ptt   m mute   Enter goto   d dev   l log   r reconn   ? help   q│
+│ ↑/↓ tg   ←/→ vol   PgDn lock   SPACE ptt   m mute   Enter goto   d dev   l log   ? help   q│
 └──────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -44,8 +45,8 @@ terminal window.
   encrypted Opus audio over UDP
 - Monitors several talkgroups at once and shows who is talking, on which one
 - Switches talkgroups automatically by **priority** when someone keys up, or
-  manually with ← / →
-- **Locks** to one talkgroup (↑) when you do not want to be pulled away
+  manually with ↑ / ↓
+- **Locks** to one talkgroup (PageDown) when you do not want to be pulled away
 - Transmits with SPACE, or from a script / foot switch via a control FIFO
 - Enrols your client certificate with the reflector sysop (`--enroll`)
 
@@ -100,7 +101,7 @@ commented version. The talkgroup part is the interesting bit:
 
 ```ini
 # '+' suffixes set priority:  8 = normal,  8+ = higher,  8++ = highest
-switchable = 8, 1745, 8000        # what ←/→ cycles through, in this order
+switchable = 8, 1745, 8000        # what ↑/↓ cycles through, in this order
 monitored  = 8++, 1745+, 8000, 9990   # everything you want to hear
 
 default_tg     = 8
@@ -164,20 +165,20 @@ See [docs/TCC.md](docs/TCC.md).
 | M3 | Audio device layer (`--list-devices`, `--audio-test`) | **done** |
 | M4 | Receive audio — Opus decode, jitter buffer, loss concealment | **done** |
 | M5 | Transmit audio, PTT via the control FIFO | **done** |
-| M6 | Talkgroup manager — priority, lock, linger, idle, mute (26 tests) | **done** |
+| M6 | Talkgroup manager — priority, lock, linger, idle, mute | **done** |
+| M7 | ncurses interface | **done** |
 | M8 | Packaging — Homebrew formula, systemd unit, `DEPLOY.md` | **done** |
-| M7 | ncurses interface | in progress |
-| M9 | Polish — device picker modal, soak testing | |
+| M9 | Review pass — sanitizers, Linux build, security fixes | **done** |
 
-Everything except the interface is verified against the live `be.svx.link`
-reflector, including a transmit/receive round-trip through the parrot
-talkgroup. `make test` runs 26 talkgroup-manager fixtures.
+All milestones complete and verified against the live `be.svx.link` reflector,
+including a transmit/receive round-trip through the parrot talkgroup. `make
+test` runs 40 checks (talkgroup preemption + crypto/replay).
 
 ## Licence
 
 MIT — see [LICENSE](LICENSE) and [THIRD-PARTY-NOTICES](THIRD-PARTY-NOTICES).
 
-Copyright (c) 2026 Joeri Van Dooren, ON3URE.
+Copyright (c) 2026 Joeri Van Dooren, ON6URE.
 
 ## Headless and scripted use
 
