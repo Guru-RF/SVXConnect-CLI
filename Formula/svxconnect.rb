@@ -1,8 +1,10 @@
 class Svxconnect < Formula
   desc "Terminal client for SvxLink reflectors"
   homepage "https://github.com/Guru-RF/SVXConnect-CLI"
+  # Stable url + sha256 are placeholders until the first tag; `brew install
+  # --HEAD svxconnect` builds from main and needs neither. See docs/RELEASING.md.
   url "https://github.com/Guru-RF/SVXConnect-CLI/archive/refs/tags/v0.1.0.tar.gz"
-  sha256 "REPLACE_WITH_shasum_-a_256_OF_THE_RELEASE_TARBALL"
+  sha256 "replace-with-sha256-of-the-release-tarball"
   license "MIT"
   head "https://github.com/Guru-RF/SVXConnect-CLI.git", branch: "main"
 
@@ -24,7 +26,7 @@ class Svxconnect < Formula
     # `brew` inside the build sandbox, where it is not available.
     system "make", "install",
            "PREFIX=#{prefix}",
-           "OPENSSL_PREFIX=#{Formula["openssl@3"].opt_prefix}"
+           "OPENSSL_PREFIX=#{formula_opt_prefix("openssl@3")}"
     pkgshare.install "example.conf"
     doc.install "README.md", "docs/PTT.md", "docs/TCC.md"
   end

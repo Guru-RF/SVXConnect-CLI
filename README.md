@@ -57,10 +57,19 @@ DMR / D-STAR / AMBE transcoding. This is a voice client.
 
 ### macOS (Homebrew)
 
+This repository is its own Homebrew tap — the formula lives in
+[`Formula/svxconnect.rb`](Formula/svxconnect.rb), so there is nothing else to
+maintain:
+
 ```sh
-brew tap Guru-RF/ham-tools
-brew install svxconnect
+brew tap guru-rf/svxconnect https://github.com/Guru-RF/SVXConnect-CLI
+brew install --HEAD svxconnect
 ```
+
+`--HEAD` builds from the `main` branch; once a version is tagged and released
+you can drop it and `brew install svxconnect` for the stable build. If Homebrew
+refuses the tap as an untrusted third party, run `brew trust guru-rf/svxconnect`
+and retry.
 
 ### Linux — Raspberry Pi OS, Debian, Ubuntu
 
