@@ -49,7 +49,8 @@ class Svxconnect < Formula
       there for a receive-only session.
 
       Transmit is a toggle: SPACE starts, SPACE stops, ESC always stops.
-      A terminal cannot see a key being released; see #{opt_doc}/PTT.md.
+      A terminal cannot see a key being released; see
+      #{opt_prefix}/share/doc/svxconnect/PTT.md.
     EOS
   end
 
