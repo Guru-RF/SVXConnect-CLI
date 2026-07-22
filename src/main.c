@@ -21,7 +21,7 @@
 #include <unistd.h>
 #include <getopt.h>
 
-#define SVX_VERSION "0.1.0-dev"
+#define SVX_VERSION "0.1.0"
 
 enum {
     MODE_TUI = 0,
