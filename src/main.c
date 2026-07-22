@@ -6,6 +6,7 @@
  */
 #include "common/config.h"
 #include "common/log.h"
+#include "common/pki.h"
 #include "common/util.h"
 #include "headless.h"
 #include "reflector/enroll.h"
@@ -67,6 +68,29 @@ static void config_help(const char *resolved) {
         "              https://github.com/Guru-RF/SVXConnect-CLI/blob/main/example.conf\n\n"
         "            Or point at a config explicitly with:  svxconnect -c <file>\n",
         resolved, dir, resolved, resolved);
+}
+
+/* Refuse to enter a connect mode without a certificate.
+ *
+ * A missing certificate is not something reconnecting can fix — every attempt
+ * would fail at the TLS stage and the client would just retry forever. So we
+ * check up front and, if there is no cert, say plainly that enrolment is needed
+ * and stop, rather than spinning. Returns 0 when enrolled. */
+static int require_enrolled(const svx_config *cfg) {
+    char key_path[1024], cert_path[1024];
+    pki_build_path(key_path,  sizeof(key_path),  cfg->pki_dir, cfg->callsign, "key");
+    pki_build_path(cert_path, sizeof(cert_path), cfg->pki_dir, cfg->callsign, "crt");
+    if (pki_file_exists(key_path) && pki_file_exists(cert_path))
+        return 0;
+
+    fprintf(stderr,
+        "\nsvxconnect: %s is not enrolled — there is no certificate in\n"
+        "              %s\n\n"
+        "            Run:  svxconnect --enroll\n"
+        "            That sends a signing request to %s and waits for the\n"
+        "            reflector operator to approve it; then start svxconnect again.\n",
+        cfg->callsign, cfg->pki_dir, cfg->reflector);
+    return 1;
 }
 
 static void usage(FILE *f) {
@@ -233,6 +257,7 @@ int main(int argc, char **argv) {
             config_help(resolved);
             return 1;
         }
+        if (require_enrolled(&cfg) != 0) return 4;
         return run_headless(&cfg, no_tx);
 
     case MODE_TUI:
@@ -241,6 +266,7 @@ int main(int argc, char **argv) {
             config_help(resolved);
             return 1;
         }
+        if (require_enrolled(&cfg) != 0) return 4;
         {
             svx_app *app = app_new(&cfg, no_tx);
             if (!app) { fprintf(stderr, "svxconnect: out of memory\n"); return 1; }
