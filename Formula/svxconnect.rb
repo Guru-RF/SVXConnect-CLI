@@ -1,10 +1,8 @@
 class Svxconnect < Formula
   desc "Terminal client for SvxLink reflectors"
   homepage "https://github.com/Guru-RF/SVXConnect-CLI"
-  # Stable url + sha256 are placeholders until the first tag; `brew install
-  # --HEAD svxconnect` builds from main and needs neither. See docs/RELEASING.md.
   url "https://github.com/Guru-RF/SVXConnect-CLI/archive/refs/tags/v0.1.0.tar.gz"
-  sha256 "replace-with-sha256-of-the-release-tarball"
+  sha256 "8ab7fd2ec1468bc15fd466c2a39f8950db7a3df8b77c5cb3a2013660dd19e424"
   license "MIT"
   head "https://github.com/Guru-RF/SVXConnect-CLI.git", branch: "main"
 
