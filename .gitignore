@@ -12,3 +12,13 @@ pki/
 
 # macOS
 .DS_Store
+
+# Debian packaging build products
+debian/.debhelper/
+debian/files
+debian/*.substvars
+debian/*.debhelper.log
+debian/svxconnect/
+debian/svxconnect-dbgsym/
+debian/tmp/
+debian/debhelper-build-stamp

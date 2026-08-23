@@ -1,0 +1,19 @@
+#!/usr/bin/make -f
+
+# The upstream Makefile already honours DESTDIR, PREFIX and CFLAGS/LDFLAGS via
+# ?=, so dh drives it directly. PREFIX must be overridden: upstream defaults to
+# /usr/local, which is correct for `make install` by hand and wrong in a
+# package.
+export DEB_BUILD_MAINT_OPTIONS = hardening=+all
+
+%:
+	dh $@ --buildsystem=makefile
+
+override_dh_auto_install:
+	dh_auto_install -- PREFIX=/usr
+
+# The upstream test suite: talkgroup preemption plus crypto and replay
+# protection. Cheap, and it is the only thing standing between a bad build and
+# a radio that mis-decrypts.
+override_dh_auto_test:
+	$(MAKE) test

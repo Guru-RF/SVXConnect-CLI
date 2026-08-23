@@ -1,0 +1,34 @@
+Source: svxconnect
+Section: hamradio
+Priority: optional
+Maintainer: Joeri Van Dooren <ure@on6ure.be>
+Build-Depends: debhelper-compat (= 13),
+               pkgconf,
+               libssl-dev,
+               libopus-dev,
+               libncurses-dev
+Standards-Version: 4.7.0
+Homepage: https://svxconnect.app
+Vcs-Git: https://github.com/Guru-RF/SVXConnect-CLI.git
+Vcs-Browser: https://github.com/Guru-RF/SVXConnect-CLI
+Rules-Requires-Root: no
+
+Package: svxconnect
+Architecture: any
+Depends: ${shlibs:Depends},
+         ${misc:Depends},
+         libasound2t64 | libasound2
+Recommends: pipewire-pulse | pulseaudio | pipewire
+Suggests: svxconnect-qt
+Description: terminal client for SvxLink reflectors
+ A command-line client for SvxLink reflectors speaking protocol v3 — mutual
+ TLS, AES-128-GCM encrypted Opus audio over UDP. Connect to a reflector,
+ monitor several talkgroups at once, switch between them by priority or by
+ hand, and transmit, all from a terminal or an SSH session.
+ .
+ Includes certificate enrolment (--enroll), an unattended --headless mode for
+ nodes, and a control FIFO so a foot switch, a GPIO pin or a script can key the
+ transmitter.
+ .
+ This package also provides the shared identity — one configuration file, one
+ client certificate, one run lock — used by the SVXConnect desktop client.

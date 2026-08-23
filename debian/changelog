@@ -1,0 +1,5 @@
+svxconnect (0.1.0-1) unstable; urgency=medium
+
+  * Initial Debian packaging.
+
+ -- Joeri Van Dooren <ure@on6ure.be>  Sun, 23 Aug 2026 11:00:00 +0200

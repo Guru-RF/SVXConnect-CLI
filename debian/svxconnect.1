@@ -1,0 +1,99 @@
+.TH SVXCONNECT 1 "August 2026" "svxconnect" "User Commands"
+.SH NAME
+svxconnect \- terminal client for SvxLink reflectors
+.SH SYNOPSIS
+.B svxconnect
+.RI [ options ]
+.SH DESCRIPTION
+.B svxconnect
+connects to a SvxLink reflector over mutual TLS and carries AES\-128\-GCM
+encrypted Opus audio over UDP. It monitors several talkgroups at once, shows who
+is talking on which, switches between them by priority or by hand, and
+transmits.
+.PP
+It shares one identity with
+.BR svxconnect\-qt (1):
+the same configuration file, the same client certificate and a shared run lock.
+Only one of the two may hold the reflector connection at a time; the other
+refuses to start and names the process in the way.
+.SH OPTIONS
+.TP
+.B \-c \fIfile\fR, \fB\-\-config \fIfile\fR
+Use this configuration file instead of the default.
+.TP
+.B \-\-enroll
+Generate a key and certificate request and send it to the reflector sysop for
+signing. Run this once, before first use.
+.TP
+.B \-\-headless
+Run with no interface, logging events to standard output. This is what the
+systemd unit runs.
+.TP
+.B \-\-no\-tx
+Receive only. Useful over SSH, where microphone capture does not work.
+.TP
+.B \-\-list\-devices
+Print the audio devices the backend can see, then exit.
+.TP
+.B \-\-audio\-test
+Loop the microphone back to the speaker with level meters, to prove the device
+path works before any reflector is involved.
+.TP
+.B \-\-dump\-config
+Print every configuration key with its resolved value, then exit.
+.SH KEYS
+.TP
+.B UP\fR, \fBDOWN
+Previous and next talkgroup.
+.TP
+.B LEFT\fR, \fBRIGHT
+Output volume.
+.TP
+.B SPACE
+Transmit. A toggle, not a hold: a terminal delivers characters, not key events,
+so there is no key release to detect. Press again, or
+.BR ESC ,
+to stop.
+.TP
+.B PageDown
+Lock the talkgroup, stopping all automatic switching.
+.TP
+.B m
+Mute or unmute the highlighted talkgroup.
+.TP
+.B d
+Audio device picker.
+.TP
+.B q
+Quit.
+.SH FILES
+.TP
+.I ~/.config/svxconnect/svxconnect.conf
+Configuration. See
+.I /usr/share/doc/svxconnect/example.conf.gz
+for a fully commented version.
+.TP
+.I ~/.config/svxconnect/pki/
+Client key and certificate.
+.TP
+.I ~/.local/state/svxconnect/ctl
+Control FIFO. Write
+.B "ptt on"
+or
+.B "ptt off"
+to it from a script, a foot switch or a compositor key binding.
+.TP
+.I ~/.local/state/svxconnect/svxconnect.lock
+The shared run lock.
+.SH ENVIRONMENT
+.TP
+.B SVXCONNECT_CONF
+Configuration file path, checked before the default locations.
+.SH SEE ALSO
+.BR svxconnect-qt (1)
+.PP
+Full documentation at
+.UR https://svxconnect.app
+.UE .
+.SH AUTHOR
+Written by Joeri Van Dooren, ON6URE.

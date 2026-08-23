@@ -185,7 +185,7 @@ test` runs 40 checks (talkgroup preemption + crypto/replay).
 
 MIT — see [LICENSE](LICENSE) and [THIRD-PARTY-NOTICES](THIRD-PARTY-NOTICES).
 
-Copyright (c) 2026 Joeri Van Dooren, ON6URE.
+Copyright (c) 2026 Diëlectricum BV. Written by Joeri Van Dooren, ON6URE.
 
 ## Headless and scripted use
 
