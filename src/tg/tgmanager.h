@@ -35,15 +35,28 @@
 #define TGM_MAX_ACTIVE 32
 #define TGM_MAX_RECENT 16
 
+/* Two spellings of the callsign, and the distinction matters.
+ *
+ * `call` is the SSID-stripped base — ON6URE-TPAD becomes ON6URE — and it is
+ * what MATCHING uses: the reflector may report a stop with a different SSID
+ * than the start, and roger-beep self-suppression has to recognise your own
+ * transmission coming back regardless of which of your nodes sent it.
+ *
+ * `full` is exactly what arrived on the wire, and it is what a user interface
+ * must SHOW. Stripping it for display loses real information: ON6URE-TPAD and
+ * ON6URE-PI are different stations belonging to the same operator, and a list
+ * that renders both as "ON6URE" cannot tell you which one is talking. */
 typedef struct {
     uint32_t tg;
-    char     call[32];       /* SSID stripped */
+    char     call[32];       /* SSID stripped — for matching only */
+    char     full[32];       /* as received — for display         */
     uint64_t start_ms;
 } tgm_talker;
 
 typedef struct {
     uint32_t tg;
-    char     call[32];
+    char     call[32];       /* SSID stripped — for matching only */
+    char     full[32];       /* as received — for display         */
     uint64_t stop_ms;
     uint32_t duration_s;
 } tgm_recent;

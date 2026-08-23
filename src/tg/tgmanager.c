@@ -88,11 +88,11 @@ static int active_find_tg(const tg_manager *m, uint32_t tg) {
 }
 
 static int active_find_call(const tg_manager *m, const char *base) {
-    for (int i = 0; i < m->n_active; i++) {
-        char b[32];
-        call_strip_ssid(b, sizeof(b), m->active[i].call);
-        if (strcmp(b, base) == 0) return i;
-    }
+    /* active[].call is already the stripped base, so compare it directly.
+     * Re-stripping here was harmless but implied the stored value might still
+     * carry an SSID, which it never does. */
+    for (int i = 0; i < m->n_active; i++)
+        if (strcmp(m->active[i].call, base) == 0) return i;
     return -1;
 }
 
@@ -104,10 +104,12 @@ static void active_erase(tg_manager *m, int idx) {
 }
 
 /* Keep active[] sorted by talkgroup id so preemption is reproducible. */
-static void active_upsert(tg_manager *m, uint32_t tg, const char *call, uint64_t now) {
+static void active_upsert(tg_manager *m, uint32_t tg, const char *base,
+                          const char *full, uint64_t now) {
     int idx = active_find_tg(m, tg);
     if (idx >= 0) {
-        snprintf(m->active[idx].call, sizeof(m->active[idx].call), "%s", call);
+        snprintf(m->active[idx].call, sizeof(m->active[idx].call), "%s", base);
+        snprintf(m->active[idx].full, sizeof(m->active[idx].full), "%s", full);
         return;                      /* keep the ORIGINAL start time */
     }
     if (m->n_active >= TGM_MAX_ACTIVE) return;
@@ -118,19 +120,21 @@ static void active_upsert(tg_manager *m, uint32_t tg, const char *call, uint64_t
             (size_t)(m->n_active - pos) * sizeof(m->active[0]));
     m->active[pos].tg       = tg;
     m->active[pos].start_ms = now;
-    snprintf(m->active[pos].call, sizeof(m->active[pos].call), "%s", call);
+    snprintf(m->active[pos].call, sizeof(m->active[pos].call), "%s", base);
+    snprintf(m->active[pos].full, sizeof(m->active[pos].full), "%s", full);
     m->n_active++;
 }
 
-static void recent_push(tg_manager *m, uint32_t tg, const char *call,
-                        uint64_t stop_ms, uint32_t dur_s) {
+static void recent_push(tg_manager *m, uint32_t tg, const char *base,
+                        const char *full, uint64_t stop_ms, uint32_t dur_s) {
     if (m->n_recent < TGM_MAX_RECENT) m->n_recent++;
     memmove(&m->recent[1], &m->recent[0],
             (size_t)(m->n_recent - 1) * sizeof(m->recent[0]));
     m->recent[0].tg         = tg;
     m->recent[0].stop_ms    = stop_ms;
     m->recent[0].duration_s = dur_s;
-    snprintf(m->recent[0].call, sizeof(m->recent[0].call), "%s", call);
+    snprintf(m->recent[0].call, sizeof(m->recent[0].call), "%s", base);
+    snprintf(m->recent[0].full, sizeof(m->recent[0].full), "%s", full);
 }
 
 static void note_heard(tg_manager *m, uint32_t tg, uint64_t now) {
@@ -246,7 +250,8 @@ void tgm_on_talker_start(tg_manager *m, uint32_t tg, const char *call) {
     char     base[32];
     call_strip_ssid(base, sizeof(base), call);
 
-    active_upsert(m, tg, base, now);
+    /* Store both: the base for matching, the wire form for display. */
+    active_upsert(m, tg, base, call ? call : base, now);
     note_heard(m, tg, now);
     m->last_traffic = now;
 
@@ -274,8 +279,14 @@ void tgm_on_talker_stop(tg_manager *m, uint32_t tg, const char *call) {
     uint32_t dur_s    = (uint32_t)((now - started) / 1000);
     int      was_mine = (was_tg == m->selected);
 
+    /* Carry the START's full callsign into the history, not the stop's: the
+     * two can differ in SSID (that is exactly why matching uses the base),
+     * and the entry being closed is the one that opened. */
+    char was_full[32];
+    snprintf(was_full, sizeof(was_full), "%s", m->active[idx].full);
+
     active_erase(m, idx);
-    recent_push(m, was_tg, base, now, dur_s);
+    recent_push(m, was_tg, base, was_full, now, dur_s);
     note_heard(m, was_tg, now);
     m->last_traffic = now;
 
