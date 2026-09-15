@@ -21,9 +21,32 @@ refuses to start and names the process in the way.
 .B \-c \fIfile\fR, \fB\-\-config \fIfile\fR
 Use this configuration file instead of the default.
 .TP
+.B \-\-set \fIkey\fB=\fIvalue\fR
+Override one configuration key. Repeatable. With
+.BR \-\-init\-config ,
+fill that key in the new file instead.
+.TP
+.B \-\-init\-config
+Write a fully commented configuration file, asking for the callsign, email
+address and reflector when run from a terminal. It is written to the file given
+with
+.BR \-c ,
+else to
+.BR $SVXCONNECT_CONF ,
+else to
+.IR ~/.config/svxconnect/svxconnect.conf .
+An existing file is left alone.
+.TP
+.B \-\-force
+With
+.BR \-\-init\-config ,
+replace an existing file, keeping the old one as
+.IR file .bak.
+.TP
 .B \-\-enroll
 Generate a key and certificate request and send it to the reflector sysop for
-signing. Run this once, before first use.
+signing. Run this once, before first use, after
+.BR \-\-init\-config .
 .TP
 .B \-\-headless
 Run with no interface, logging events to standard output. This is what the
@@ -69,9 +92,10 @@ Quit.
 .SH FILES
 .TP
 .I ~/.config/svxconnect/svxconnect.conf
-Configuration. See
-.I /usr/share/doc/svxconnect/example.conf.gz
-for a fully commented version.
+Configuration. Create it with
+.BR "svxconnect \-\-init\-config" ,
+which writes the fully commented example also found at
+.IR /usr/share/doc/svxconnect/example.conf.gz .
 .TP
 .I ~/.config/svxconnect/pki/
 Client key and certificate.

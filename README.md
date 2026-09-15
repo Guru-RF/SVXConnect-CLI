@@ -87,19 +87,29 @@ which is already installed; on older or bare systems it falls back to ALSA.
 ## First run
 
 ```sh
-mkdir -p ~/.config/svxconnect
-cp example.conf ~/.config/svxconnect/svxconnect.conf
-$EDITOR ~/.config/svxconnect/svxconnect.conf
+svxconnect --init-config   # asks for your callsign, email and reflector
+svxconnect --enroll        # send a CSR, wait for the sysop to sign it
+svxconnect                 # go
+```
 
-svxconnect --enroll     # send a CSR, wait for the sysop to sign it
-svxconnect              # go
+`--init-config` writes the fully commented [example.conf](example.conf) to
+`~/.config/svxconnect/svxconnect.conf` with your callsign, email and reflector
+filled in. Press Enter at a question to leave that key for later. It never
+overwrites an existing file unless you add `--force`, which keeps the old one as
+`svxconnect.conf.bak`. Without a terminal, for example in a script, nothing is
+asked, and `--set` fills in any key:
+
+```sh
+svxconnect --init-config --set callsign=ON4ABC --set email=me@example.org \
+                         --set reflector=be.svx.link --set monitored=8++,1745+
 ```
 
 The config is looked for at `$SVXCONNECT_CONF`, then
 `~/.config/svxconnect/svxconnect.conf` (or `$XDG_CONFIG_HOME/svxconnect/…`),
-then `/etc/svxconnect/svxconnect.conf` — or pass one explicitly with
-`svxconnect -c <file>`. If none is found, svxconnect prints the exact path to
-create. `svxconnect --dump-config` prints every setting with its resolved value.
+then `/etc/svxconnect/svxconnect.conf`. You can also pass one explicitly with
+`svxconnect -c <file>`, which works with `--init-config` too. If none is found,
+svxconnect says how to create one. `svxconnect --dump-config` prints every
+setting with its resolved value.
 
 ## Configuration
 

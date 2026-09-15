@@ -5,6 +5,7 @@
  * Released under the MIT License; see LICENSE.
  */
 #include "common/config.h"
+#include "common/conftemplate.h"
 #include "common/lock.h"
 #include "common/log.h"
 #include "common/pki.h"
@@ -15,6 +16,9 @@
 #include "app.h"
 #include "ui/ui.h"
 
+#include <ctype.h>
+#include <errno.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -25,13 +29,22 @@
 
 #define SVX_VERSION "0.1.0"
 
+/* example.conf, embedded at build time by the Makefile's example_conf.inc
+ * rule, so --init-config needs no data file at a path that differs between
+ * Homebrew, Debian and a source build — and can never be out of step with the
+ * binary that reads the result. */
+static const char EXAMPLE_CONF[] =
+#include "example_conf.inc"
+;
+
 enum {
     MODE_TUI = 0,
     MODE_HEADLESS,
     MODE_ENROLL,
     MODE_LIST_DEVICES,
     MODE_AUDIO_TEST,
-    MODE_DUMP_CONFIG
+    MODE_DUMP_CONFIG,
+    MODE_INIT_CONFIG
 };
 
 /* Print, after a validation failure, where the configuration is expected and
@@ -46,29 +59,19 @@ static void config_help(const char *resolved) {
             "\nsvxconnect: the configuration at\n"
             "              %s\n"
             "            is incomplete — see the errors above. Edit that file,\n"
-            "            or start fresh from the example:\n"
-            "              https://github.com/Guru-RF/SVXConnect-CLI/blob/main/example.conf\n",
+            "            or start over with:  svxconnect --init-config --force\n",
             resolved);
         return;
     }
 
-    /* Derive the directory to create from the path. */
-    char dir[1024];
-    snprintf(dir, sizeof(dir), "%s", resolved);
-    char *slash = strrchr(dir, '/');
-    if (slash) *slash = '\0'; else snprintf(dir, sizeof(dir), ".");
-
     fprintf(stderr,
-        "\nsvxconnect: no configuration file found. Create one at:\n"
-        "              %s\n\n"
-        "            mkdir -p %s\n"
-        "            cp <example.conf> %s\n"
-        "            $EDITOR %s\n\n"
-        "            The example is bundled with the install (Homebrew:\n"
-        "            $(brew --prefix)/share/svxconnect/example.conf) or online:\n"
-        "              https://github.com/Guru-RF/SVXConnect-CLI/blob/main/example.conf\n\n"
+        "\nsvxconnect: no configuration file found. Create one with:\n\n"
+        "              svxconnect --init-config\n\n"
+        "            That writes a fully commented configuration to\n"
+        "              %s\n"
+        "            and asks for your callsign, email and reflector.\n\n"
         "            Or point at a config explicitly with:  svxconnect -c <file>\n",
-        resolved, dir, resolved, resolved);
+        resolved);
 }
 
 /* Refuse to enter a connect mode without a certificate.
@@ -118,6 +121,261 @@ static int acquire_run_lock(const svx_config *cfg, const char *kind) {
     return -1;
 }
 
+/* ------------------------------------------------------------ --init-config */
+
+/* The file --init-config writes: -c, else $SVXCONNECT_CONF, else the per-user
+ * path. Deliberately NOT config_default_path(), which answers with
+ * /etc/svxconnect/svxconnect.conf whenever that exists — a user asking for a
+ * configuration of their own must not be sent to overwrite the system one. */
+static void init_config_path(char *dst, size_t cap, const char *conf_path) {
+    const char *env  = getenv("SVXCONNECT_CONF");
+    const char *xdg  = getenv("XDG_CONFIG_HOME");
+    const char *home = getenv("HOME");
+
+    if (conf_path)          path_expand(dst, cap, conf_path);
+    else if (env && *env)   path_expand(dst, cap, env);
+    else if (xdg && *xdg)   snprintf(dst, cap, "%s/svxconnect/svxconnect.conf", xdg);
+    else if (home && *home) snprintf(dst, cap, "%s/.config/svxconnect/svxconnect.conf", home);
+    else                    snprintf(dst, cap, "./svxconnect.conf");
+}
+
+static int valid_callsign(const char *s) {
+    for (const char *p = s; *p; p++) {
+        if (!isalnum((unsigned char)*p) && *p != '-') {
+            printf("    A callsign is letters, digits and '-', e.g. ON4ABC.\n");
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static int valid_email(const char *s) {
+    const char *at = strchr(s, '@');
+    if (!at || at == s || !strchr(at, '.') || strchr(s, ' ')) {
+        printf("    That does not look like an email address.\n");
+        return 0;
+    }
+    return 1;
+}
+
+static int valid_host(const char *s) {
+    if (!strchr(s, '.') || strchr(s, ' ') || strchr(s, '/') || strchr(s, ':')) {
+        printf("    Give just the host name, e.g. be.svx.link — no port, no URL.\n");
+        return 0;
+    }
+    return 1;
+}
+
+/* Ask one question on the terminal. Returns 1 with `out` filled, or 0 when the
+ * user pressed Enter (or gave up after three invalid answers) and the key is
+ * left for them to fill in by hand. */
+static int ask(const char *question, char *out, size_t cap, int (*valid)(const char *)) {
+    for (int attempt = 0; attempt < 3; attempt++) {
+        printf("  %s: ", question);
+        fflush(stdout);
+        if (!fgets(out, (int)cap, stdin)) {
+            printf("\n");
+            out[0] = '\0';
+            return 0;
+        }
+        char *v = str_trim(out);
+        memmove(out, v, strlen(v) + 1);
+        if (out[0] == '\0') return 0;
+        if (valid(out)) return 1;
+    }
+    out[0] = '\0';
+    return 0;
+}
+
+static int has_key(const conftpl_kv *kv, int n, const char *key) {
+    for (int i = 0; i < n; i++)
+        if (str_ieq(kv[i].key, key)) return 1;
+    return 0;
+}
+
+static int run_init_config(const char *conf_path, const char **sets, int n_sets, int force) {
+    char path[1024];
+    init_config_path(path, sizeof(path), conf_path);
+    const int existed = (access(path, F_OK) == 0);
+
+    if (existed && !force) {
+        fprintf(stderr,
+            "\nsvxconnect: %s already exists — nothing written.\n"
+            "            Edit it, or start over with:  svxconnect --init-config --force\n"
+            "            (the current file is then kept as %s.bak)\n",
+            path, path);
+        return 1;
+    }
+
+    /* --set values go through the real parser first, so a typo or an
+     * out-of-range number is refused here instead of being written into a file
+     * that then fails to load. */
+    conftpl_kv kv[64];
+    char       keys[64][64];
+    char       vals[64][512];
+    int        n_kv = 0;
+    svx_config scratch;
+    config_defaults(&scratch);
+
+    for (int i = 0; i < n_sets && n_kv < 60; i++) {
+        char buf[600];
+        snprintf(buf, sizeof(buf), "%s", sets[i]);
+        char *eq = strchr(buf, '=');
+        if (!eq) {
+            fprintf(stderr, "svxconnect: --set needs KEY=VALUE, got '%s'\n", sets[i]);
+            return 2;
+        }
+        *eq = '\0';
+        const char *k = str_trim(buf);
+        const char *v = str_trim(eq + 1);
+        if (config_set(&scratch, k, v) != 0) return 2;
+
+        snprintf(keys[n_kv], sizeof(keys[n_kv]), "%s", k);
+        snprintf(vals[n_kv], sizeof(vals[n_kv]), "%s", v);
+        kv[n_kv].key   = keys[n_kv];
+        kv[n_kv].value = vals[n_kv];
+        n_kv++;
+    }
+
+    /* Ask for the identity that was not given — but only when someone is
+     * there to answer. From a script, a package test or a pipe, the keys are
+     * simply left empty for the user to fill in. */
+    static const struct {
+        const char *key;
+        const char *question;
+        int (*valid)(const char *);
+    } ASK[] = {
+        { "callsign",  "Callsign",                                   valid_callsign },
+        { "email",     "Email address (so the reflector sysop can reach you)", valid_email },
+        { "reflector", "Reflector host, e.g. be.svx.link",           valid_host },
+    };
+
+    const int interactive = isatty(STDIN_FILENO) && isatty(STDOUT_FILENO);
+    int asked = 0;
+    for (int i = 0; i < 3 && n_kv < 64; i++) {
+        if (has_key(kv, n_kv, ASK[i].key) || !interactive) continue;
+        if (!asked) {
+            printf("Creating %s\nPress Enter to skip a question and fill it in later.\n\n", path);
+            asked = 1;
+        }
+        if (ask(ASK[i].question, vals[n_kv], sizeof(vals[n_kv]), ASK[i].valid)) {
+            snprintf(keys[n_kv], sizeof(keys[n_kv]), "%s", ASK[i].key);
+            kv[n_kv].key   = keys[n_kv];
+            kv[n_kv].value = vals[n_kv];
+            n_kv++;
+        }
+    }
+
+    /* The callsign is also the certificate's file name stem; write it the way
+     * config_set() will read it. */
+    for (int i = 0; i < n_kv; i++)
+        if (str_ieq(kv[i].key, "callsign")) str_upper(vals[i]);
+
+    char header[768];
+    snprintf(header, sizeof(header),
+        "# SVXConnect configuration\n"
+        "#\n"
+        "# Written by `svxconnect --init-config` (svxconnect %s) from the bundled\n"
+        "# example. Every setting is listed with an explanation. The three you must\n"
+        "# fill in are callsign, email and reflector; everything else has a default\n"
+        "# that works.\n"
+        "#\n"
+        "# Shared with the SVXConnect desktop apps: one file, one identity.\n"
+        "# `svxconnect --dump-config` prints what the program actually read.\n"
+        "#\n"
+        "# Syntax: '#' or ';' starts a comment ('\\#' is a literal hash). Keys are\n"
+        "# case-insensitive. Booleans: on/off, yes/no, true/false, 1/0.\n",
+        SVX_VERSION);
+
+    char *text = conftpl_render(EXAMPLE_CONF, header, kv, n_kv);
+    if (!text) {
+        fprintf(stderr, "svxconnect: out of memory\n");
+        return 1;
+    }
+
+    char dir[1024];
+    snprintf(dir, sizeof(dir), "%s", path);
+    char *slash = strrchr(dir, '/');
+    if (slash && slash != dir) {
+        *slash = '\0';
+        if (mkdir_p(dir, 0700) != 0) {
+            fprintf(stderr, "svxconnect: cannot create %s: %s\n", dir, strerror(errno));
+            free(text);
+            return 1;
+        }
+    }
+
+    /* Written beside the target and renamed into place, so an interrupted
+     * write never leaves half a configuration behind; mode 0600 from the
+     * start, because the file names an email address. */
+    char tmp[1100];
+    snprintf(tmp, sizeof(tmp), "%s.tmp.%ld", path, (long)getpid());
+    int fd = open(tmp, O_WRONLY | O_CREAT | O_EXCL, 0600);
+    if (fd < 0) {
+        fprintf(stderr, "svxconnect: cannot write %s: %s\n", tmp, strerror(errno));
+        free(text);
+        return 1;
+    }
+
+    const char *p   = text;
+    size_t      len = strlen(text);
+    while (len > 0) {
+        ssize_t w = write(fd, p, len);
+        if (w < 0) {
+            if (errno == EINTR) continue;
+            fprintf(stderr, "svxconnect: cannot write %s: %s\n", tmp, strerror(errno));
+            close(fd);
+            unlink(tmp);
+            free(text);
+            return 1;
+        }
+        p   += w;
+        len -= (size_t)w;
+    }
+    fsync(fd);
+    close(fd);
+    free(text);
+
+    char bak[1100] = "";
+    if (existed) {
+        snprintf(bak, sizeof(bak), "%s.bak", path);
+        if (rename(path, bak) != 0) {
+            fprintf(stderr, "svxconnect: cannot keep the old file as %s: %s\n", bak, strerror(errno));
+            unlink(tmp);
+            return 1;
+        }
+    }
+    if (rename(tmp, path) != 0) {
+        fprintf(stderr, "svxconnect: cannot create %s: %s\n", path, strerror(errno));
+        unlink(tmp);
+        return 1;
+    }
+
+    /* Read it back, the way every later run will, to report what is missing. */
+    svx_config written;
+    config_defaults(&written);
+    config_load(&written, path);
+
+    char missing[64] = "";
+    if (!written.callsign[0])  strcat(missing, missing[0] ? ", callsign"  : "callsign");
+    if (!written.email[0])     strcat(missing, missing[0] ? ", email"     : "email");
+    if (!written.reflector[0]) strcat(missing, missing[0] ? ", reflector" : "reflector");
+
+    printf("\nWrote %s\n", path);
+    if (bak[0]) printf("The previous file is kept as %s\n", bak);
+
+    if (missing[0]) {
+        printf("\nStill to fill in: %s\n"
+               "  $EDITOR %s\n"
+               "\nThen:\n", missing, path);
+    } else {
+        printf("\nNext:\n");
+    }
+    printf("  svxconnect --enroll    # send a signing request; wait for the sysop to approve it\n"
+           "  svxconnect             # and you are on the air\n");
+    return 0;
+}
+
 static void usage(FILE *f) {
     fprintf(f,
 "svxconnect " SVX_VERSION " — terminal client for SvxLink reflectors\n"
@@ -133,6 +391,9 @@ static void usage(FILE *f) {
 "  -v, --verbose         log at debug level\n"
 "      --no-tx           receive only; never open the microphone\n"
 "      --headless        no TUI, log events to stdout\n"
+"      --init-config     write a fully commented configuration, asking for your\n"
+"                        callsign, email and reflector; --set fills in any key\n"
+"      --force           with --init-config: replace an existing file (kept as .bak)\n"
 "      --enroll          generate a CSR and wait for the sysop to sign it\n"
 "      --list-devices    list audio input and output devices, then exit\n"
 "      --audio-test      loop the microphone back to the speaker, then exit\n"
@@ -163,6 +424,7 @@ int main(int argc, char **argv) {
     int  verbose     = 0;
     int  no_tx       = 0;
     int  force_ascii = 0;
+    int  force       = 0;
     const char *conf_path = NULL;
 
     /* --set overrides are collected and applied after the file, so the command
@@ -181,6 +443,8 @@ int main(int argc, char **argv) {
         { "audio-test",   no_argument,       0,  6  },
         { "dump-config",  no_argument,       0,  7  },
         { "ascii",        no_argument,       0,  8  },
+        { "init-config",  no_argument,       0,  9  },
+        { "force",        no_argument,       0, 10  },
         { "version",      no_argument,       0, 'V' },
         { "help",         no_argument,       0, 'h' },
         { 0, 0, 0, 0 }
@@ -203,6 +467,8 @@ int main(int argc, char **argv) {
         case  6: mode = MODE_AUDIO_TEST; break;
         case  7: mode = MODE_DUMP_CONFIG; break;
         case  8: force_ascii = 1; break;
+        case  9: mode = MODE_INIT_CONFIG; break;
+        case 10: force = 1; break;
         case 'V': printf("svxconnect %s\n", SVX_VERSION); return 0;
         case 'h': usage(stdout); return 0;
         default:  usage(stderr); return 2;
@@ -213,8 +479,17 @@ int main(int argc, char **argv) {
         usage(stderr);
         return 2;
     }
+    if (force && mode != MODE_INIT_CONFIG) {
+        fprintf(stderr, "svxconnect: --force only applies to --init-config\n");
+        return 2;
+    }
 
     if (verbose) log_set_level(LOG_DBG);
+
+    /* Before any configuration is loaded: there usually is none yet, and an
+     * explicit -c naming a file that does not exist is exactly the point. */
+    if (mode == MODE_INIT_CONFIG)
+        return run_init_config(conf_path, sets, n_sets, force);
 
     /* ---- configuration ---- */
     svx_config cfg;

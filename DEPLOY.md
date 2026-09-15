@@ -37,10 +37,13 @@ The `audio` group is what gives the service access to `/dev/snd`.
 One file per instance, named after the instance:
 
 ```sh
-sudo mkdir -p /etc/svxconnect
-sudo cp example.conf /etc/svxconnect/be.conf
+sudo svxconnect --init-config -c /etc/svxconnect/be.conf
 sudo $EDITOR /etc/svxconnect/be.conf
 ```
+
+`--init-config` creates the directory, writes the fully commented example and
+asks for the callsign, email and reflector. Add `--set key=value` for any other
+key, which is handy when provisioning several instances from a script.
 
 Point the writable paths at the service's state directory:
 

@@ -127,9 +127,32 @@ $(BUILD)/%.o: %.m
 $(BUILD)/src/audio/dev_miniaudio.o: CFLAGS += -Wno-unused-function -Wno-unused-variable \
                                               -Wno-sign-compare -Wno-unused-but-set-variable
 
+# example.conf, embedded as a C string for --init-config. Each line becomes a
+# "...\n" literal with \ and " escaped. sed, because it is on every build host
+# as-is — xxd is not on a bare Debian.
+GEN := $(BUILD)/gen
+
+$(GEN)/example_conf.inc: example.conf
+	@mkdir -p $(@D)
+	sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/^/"/' -e 's/$$/\\n"/' $< > $@
+
+$(BUILD)/src/main.o $(BUILD)/tests/conftest.o: $(GEN)/example_conf.inc
+$(BUILD)/src/main.o $(BUILD)/tests/conftest.o: CPPFLAGS += -I$(GEN)
+
 # Unit tests. Only the pure-logic modules are covered: the talkgroup
 # preemption rules, which have no I/O and are where a subtle mistake is both
-# most likely and least visible.
+# most likely and least visible; and the --init-config renderer, which writes
+# into a file the user owns.
+CONF_TEST_OBJ := $(BUILD)/tests/conftest.o \
+                 $(BUILD)/src/common/conftemplate.o \
+                 $(BUILD)/src/common/config.o \
+                 $(BUILD)/src/common/log.o \
+                 $(BUILD)/src/common/util.o
+
+$(BUILD)/conftest: $(CONF_TEST_OBJ)
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $^ -lm
+
 TEST_OBJ := $(BUILD)/tests/tgtest.o \
             $(BUILD)/src/tg/tgmanager.o \
             $(BUILD)/src/common/config.o \
@@ -148,9 +171,10 @@ $(BUILD)/cryptotest: $(CRYPTO_TEST_OBJ)
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $^ -lssl -lcrypto -lm
 
-test: $(BUILD)/tgtest $(BUILD)/cryptotest
+test: $(BUILD)/tgtest $(BUILD)/cryptotest $(BUILD)/conftest
 	@$(BUILD)/tgtest
 	@$(BUILD)/cryptotest
+	@$(BUILD)/conftest
 
 asan:
 	$(MAKE) clean

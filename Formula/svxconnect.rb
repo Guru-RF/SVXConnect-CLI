@@ -32,11 +32,12 @@ class Svxconnect < Formula
   def caveats
     <<~EOS
       Get started:
-        mkdir -p ~/.config/svxconnect
-        cp #{opt_pkgshare}/example.conf ~/.config/svxconnect/svxconnect.conf
-        $EDITOR ~/.config/svxconnect/svxconnect.conf
-        svxconnect --enroll     # then wait for the reflector sysop to sign
+        svxconnect --init-config   # asks for your callsign, email and reflector
+        svxconnect --enroll        # then wait for the reflector sysop to sign
         svxconnect
+
+      The commented example it starts from is also at
+        #{opt_pkgshare}/example.conf
 
       Microphone: macOS attributes the request to your TERMINAL application,
       not to svxconnect, so the prompt will name Terminal / iTerm / Ghostty.
@@ -58,6 +59,14 @@ class Svxconnect < Formula
     # --list-devices must work with no configuration at all: it is the first
     # thing anyone runs when the audio is not behaving.
     assert_match "backend", shell_output("#{bin}/svxconnect --list-devices 2>&1")
+
+    # --init-config writes a loadable config with what --set gave it, and no
+    # one else's identity: there is no terminal here, so nothing is asked.
+    system bin/"svxconnect", "--init-config", "-c", testpath/"new.conf",
+           "--set", "callsign=N0CALL", "--set", "reflector=reflector.example.org"
+    assert_match(/^callsign\s+=\s+N0CALL/, (testpath/"new.conf").read)
+    refute_match "ON6URE", (testpath/"new.conf").read
+    assert_match "N0CALL", shell_output("#{bin}/svxconnect -c #{testpath}/new.conf --dump-config")
 
     # A config with no callsign must be rejected rather than half-started.
     (testpath/"bad.conf").write "reflector = example.org\n"
