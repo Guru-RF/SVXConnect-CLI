@@ -40,6 +40,35 @@ release:
 
 After that, `brew install svxconnect` (no `--HEAD`) installs the tagged build.
 
+## Arch Linux packages
+
+The PKGBUILDs live in `packaging/arch/`. After tagging:
+
+1. In `packaging/arch/svxconnect/PKGBUILD`, set `pkgver` (and reset `pkgrel=1`)
+   and put the tag tarball's checksum from step 2 above in `sha256sums`.
+2. Build and test it: `cd packaging/arch/svxconnect && makepkg -f`. `check()`
+   runs `make test`.
+3. Attach the package, not the `-debug` one, to the GitHub release:
+
+   ```sh
+   gh release create v0.1.1 --title v0.1.1 --notes-file NOTES.md \
+     packaging/arch/svxconnect/svxconnect-0.1.1-1-x86_64.pkg.tar.zst
+   ```
+
+4. In `packaging/arch/svxconnect-bin/PKGBUILD`, set `pkgver` and put
+   `sha256sum` of that package file in `sha256sums`.
+5. Regenerate each `.SRCINFO`: `makepkg --printsrcinfo > .SRCINFO` in all three
+   directories.
+6. Update the `pacman -U` URL in `README.md`.
+
+To publish on the AUR, each package directory is its own AUR git repository:
+
+```sh
+git clone ssh://aur@aur.archlinux.org/svxconnect.git aur-svxconnect
+cp packaging/arch/svxconnect/{PKGBUILD,.SRCINFO} aur-svxconnect/
+cd aur-svxconnect && git add PKGBUILD .SRCINFO && git commit -m "0.1.1-1" && git push
+```
+
 ## Making the repo public
 
 The tap only works for people who can clone the repo, so `brew install --HEAD`

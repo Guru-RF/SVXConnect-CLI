@@ -22,3 +22,10 @@ debian/svxconnect/
 debian/svxconnect-dbgsym/
 debian/tmp/
 debian/debhelper-build-stamp
+
+# Arch packaging build products (makepkg in packaging/arch/*)
+packaging/arch/*/src/
+packaging/arch/*/pkg/
+packaging/arch/*/*.pkg.tar.*
+packaging/arch/*/*.tar.gz
+packaging/arch/*/svxconnect/

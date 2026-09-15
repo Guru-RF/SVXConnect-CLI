@@ -69,6 +69,31 @@ brew install svxconnect
 If Homebrew refuses the tap as an untrusted third party, run
 `brew trust guru-rf/svxconnect` and retry.
 
+### Arch Linux / Omarchy
+
+Every [release](https://github.com/Guru-RF/SVXConnect-CLI/releases) carries a
+ready-built package that pacman installs straight from the URL:
+
+```sh
+sudo pacman -U https://github.com/Guru-RF/SVXConnect-CLI/releases/download/v0.1.1/svxconnect-0.1.1-1-x86_64.pkg.tar.zst
+```
+
+Or build it yourself from the PKGBUILDs in
+[`packaging/arch/`](packaging/arch/): `svxconnect` for the tagged release,
+`svxconnect-git` for the latest `main`, and `svxconnect-bin` to install the
+package from the release:
+
+```sh
+git clone https://github.com/Guru-RF/SVXConnect-CLI
+cd SVXConnect-CLI/packaging/arch/svxconnect     # or svxconnect-git
+makepkg -si
+```
+
+Omarchy runs PipeWire, so audio needs nothing further. The package also installs
+the man page, the `svxconnect@.service` unit and the `svxconnect` system user
+it runs as, so on Arch you can skip the user and install steps in
+[DEPLOY.md](DEPLOY.md).
+
 ### Linux — Raspberry Pi OS, Debian, Ubuntu
 
 ```sh

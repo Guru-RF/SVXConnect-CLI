@@ -1,0 +1,28 @@
+# Maintainer: Joeri Van Dooren <ure@on6ure.be>
+
+# Repackages the svxconnect package attached to the GitHub release, built from
+# packaging/arch/svxconnect with the same PKGBUILD.
+
+pkgname=svxconnect-bin
+_pkgname=svxconnect
+pkgver=0.1.1
+pkgrel=1
+_pkgrel=1
+pkgdesc='Terminal client for SvxLink reflectors (prebuilt)'
+arch=('x86_64')
+url='https://github.com/Guru-RF/SVXConnect-CLI'
+license=('MIT' 'MIT-0 OR Unlicense')
+depends=('glibc' 'openssl' 'opus' 'ncurses' 'alsa-lib')
+optdepends=('libpulse: PulseAudio / pipewire-pulse audio backend')
+provides=("$_pkgname=$pkgver")
+conflicts=("$_pkgname")
+options=('!strip' '!debug')
+source=("$url/releases/download/v$pkgver/$_pkgname-$pkgver-$_pkgrel-x86_64.pkg.tar.zst")
+noextract=("$_pkgname-$pkgver-$_pkgrel-x86_64.pkg.tar.zst")
+sha256sums=('84d232a874b866740be540ab50a8698b70b515e66c73b9ae838b7d1c7913f921')
+
+package() {
+  bsdtar -xf "$_pkgname-$pkgver-$_pkgrel-x86_64.pkg.tar.zst" -C "$pkgdir" \
+    --exclude .PKGINFO --exclude .BUILDINFO --exclude .MTREE
+  mv "$pkgdir/usr/share/licenses/$_pkgname" "$pkgdir/usr/share/licenses/$pkgname"
+}

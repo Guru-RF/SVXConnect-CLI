@@ -1,0 +1,65 @@
+# Maintainer: Joeri Van Dooren <ure@on6ure.be>
+
+pkgname=svxconnect-git
+_pkgname=svxconnect
+pkgver=0.1.1.r0.g737f0c0
+pkgrel=1
+pkgdesc='Terminal client for SvxLink reflectors (development version from main)'
+arch=('x86_64' 'aarch64')
+url='https://github.com/Guru-RF/SVXConnect-CLI'
+# miniaudio is vendored and compiled in: public domain (Unlicense) or MIT-0.
+license=('MIT' 'MIT-0 OR Unlicense')
+# miniaudio dlopen()s libasound.so.2 rather than linking it, so nothing would
+# pull alsa-lib in and the package would install with no audio at all.
+depends=('glibc' 'openssl' 'opus' 'ncurses' 'alsa-lib')
+makedepends=('git' 'pkgconf')
+optdepends=('libpulse: PulseAudio / pipewire-pulse audio backend')
+provides=("$_pkgname")
+conflicts=("$_pkgname")
+source=("$_pkgname::git+$url.git#branch=main")
+sha256sums=('SKIP')
+
+pkgver() {
+  cd "$_pkgname"
+  git describe --long --tags --abbrev=7 | sed 's/^v//;s/\([^-]*-g\)/r\1/;s/-/./g'
+}
+
+prepare() {
+  cd "$_pkgname"
+  # The unit is written for `make install` into /usr/local.
+  sed -i 's#/usr/local/bin/svxconnect#/usr/bin/svxconnect#' packaging/systemd/svxconnect@.service
+  # The man page names the Debian doc path, where example.conf is gzipped.
+  sed -i 's#example\.conf\.gz#example.conf#' debian/svxconnect.1
+}
+
+build() {
+  cd "$_pkgname"
+  # makepkg's CFLAGS replace the Makefile's default, -std=gnu11 included, and
+  # GCC 15+ would otherwise compile as gnu23.
+  make CFLAGS="$CFLAGS -std=gnu11" PREFIX=/usr
+}
+
+check() {
+  cd "$_pkgname"
+  make CFLAGS="$CFLAGS -std=gnu11" test
+}
+
+package() {
+  cd "$_pkgname"
+  make DESTDIR="$pkgdir" PREFIX=/usr install
+
+  install -Dm644 debian/svxconnect.1 "$pkgdir/usr/share/man/man1/svxconnect.1"
+  install -Dm644 packaging/systemd/svxconnect@.service \
+    "$pkgdir/usr/lib/systemd/system/svxconnect@.service"
+
+  # The system user the unit runs as (DEPLOY.md creates it by hand).
+  install -Dm644 /dev/stdin "$pkgdir/usr/lib/sysusers.d/svxconnect.conf" <<'EOF'
+u svxconnect - "SVXConnect reflector node" /var/lib/svxconnect
+m svxconnect audio
+EOF
+
+  install -Dm644 -t "$pkgdir/usr/share/doc/$_pkgname" \
+    README.md DEPLOY.md example.conf docs/PTT.md
+  install -Dm644 -t "$pkgdir/usr/share/licenses/$pkgname" \
+    LICENSE THIRD-PARTY-NOTICES
+}

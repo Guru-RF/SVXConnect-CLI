@@ -1,0 +1,23 @@
+pkgbase = svxconnect-git
+	pkgdesc = Terminal client for SvxLink reflectors (development version from main)
+	pkgver = 0.1.1.r0.g737f0c0
+	pkgrel = 1
+	url = https://github.com/Guru-RF/SVXConnect-CLI
+	arch = x86_64
+	arch = aarch64
+	license = MIT
+	license = MIT-0 OR Unlicense
+	makedepends = git
+	makedepends = pkgconf
+	depends = glibc
+	depends = openssl
+	depends = opus
+	depends = ncurses
+	depends = alsa-lib
+	optdepends = libpulse: PulseAudio / pipewire-pulse audio backend
+	provides = svxconnect
+	conflicts = svxconnect
+	source = svxconnect::git+https://github.com/Guru-RF/SVXConnect-CLI.git#branch=main
+	sha256sums = SKIP
+
+pkgname = svxconnect-git
