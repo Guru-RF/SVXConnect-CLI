@@ -1,3 +1,10 @@
+svxconnect (0.1.1-1) unstable; urgency=medium
+
+  * New upstream release: --init-config writes a first configuration.
+  * Adds a manual page.
+
+ -- Joeri Van Dooren <ure@on6ure.be>  Tue, 15 Sep 2026 23:39:23 +0200
+
 svxconnect (0.1.0-1) unstable; urgency=medium
 
   * Initial Debian packaging.

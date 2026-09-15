@@ -189,7 +189,8 @@ See [docs/TCC.md](docs/TCC.md).
 
 All milestones complete and verified against the live `be.svx.link` reflector,
 including a transmit/receive round-trip through the parrot talkgroup. `make
-test` runs 40 checks (talkgroup preemption + crypto/replay).
+test` runs 58 checks (talkgroup preemption, crypto/replay, and the
+`--init-config` renderer).
 
 ## Licence
 
