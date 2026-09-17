@@ -214,6 +214,19 @@ static void audio_stop(svx_app *a) {
 static void tx_beep(svx_app *a, int count) {
     if (!a->audio_ready) return;
 
+    /* Beeps are written straight into the playback ring, which sits BELOW the
+     * jitter buffer — and the jitter buffer's volume is where both the volume
+     * setting and mute actually live (app_set_volume, app_toggle_output_mute
+     * do nothing else). So a beep that does not apply them itself plays at
+     * full level through a muted output, which is what the roger beep did.
+     *
+     * app_test_tone() still works while muted: it lifts the volume and clears
+     * the mute before it gets here, because proving the output path is the
+     * whole point of it. */
+    if (a->out_muted) return;
+    const float gain = (float)a->cfg->output_volume_pct / 100.0f;
+    if (gain <= 0.0f) return;
+
     int16_t tone[SVX_RATE / 8];              /* 125 ms */
     const int n     = SVX_RATE / 8;
     const int ramp  = SVX_RATE / 100;        /* 10 ms, so it does not click */
@@ -223,7 +236,7 @@ static void tx_beep(svx_app *a, int count) {
             if (i < ramp)          env = (float)i / (float)ramp;
             else if (i > n - ramp) env = (float)(n - i) / (float)ramp;
             float s = sinf(2.0f * (float)M_PI * 800.0f * (float)i / (float)SVX_RATE);
-            tone[i] = (int16_t)(s * env * 0.35f * 32767.0f);
+            tone[i] = (int16_t)(s * env * gain * 0.35f * 32767.0f);
         }
         svx_ring_write(&a->play_ring, tone, (uint32_t)n);
         int16_t gap[SVX_RATE / 16];          /* 62 ms of silence between beeps */

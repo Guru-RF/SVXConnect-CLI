@@ -1,3 +1,11 @@
+svxconnect (0.1.2-1) unstable; urgency=medium
+
+  * Beeps honour the output volume and mute: the roger beep played at full
+    level through a muted output, because beeps are written below the jitter
+    buffer, where the volume and mute actually live.
+
+ -- Joeri Van Dooren <ure@on6ure.be>  Thu, 17 Sep 2026 16:18:46 +0200
+
 svxconnect (0.1.1-1) unstable; urgency=medium
 
   * New upstream release: --init-config writes a first configuration.
