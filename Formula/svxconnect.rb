@@ -1,8 +1,8 @@
 class Svxconnect < Formula
   desc "Terminal client for SvxLink reflectors"
   homepage "https://github.com/Guru-RF/SVXConnect-CLI"
-  url "https://github.com/Guru-RF/SVXConnect-CLI/archive/refs/tags/v0.1.1.tar.gz"
-  sha256 "c956f7bad68998dcd5ecba6483dcecac6adb74e1ada6ce190598e2c20de06f04"
+  url "https://github.com/Guru-RF/SVXConnect-CLI/archive/refs/tags/v0.1.2.tar.gz"
+  sha256 "6c521e88ea95d8fdc1383b0cc14dfaa55598b74345fb0e604666ddcee3177cf4"
   license "MIT"
   head "https://github.com/Guru-RF/SVXConnect-CLI.git", branch: "main"
 
