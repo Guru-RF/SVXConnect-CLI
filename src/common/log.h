@@ -32,7 +32,13 @@ int  log_open_file(const char *path);
 void log_close_file(void);
 
 /* Replace the sink. `line` is a complete, already-formatted line without a
- * trailing newline. Passing NULL restores the default (stderr or log file). */
+ * trailing newline. Passing NULL restores the default (stderr or log file).
+ *
+ * The sink is called from whichever thread logs — the reflector's connect
+ * worker as well as the main thread — but never from two at once: every call
+ * is made under one internal lock. log_set_sink() takes that lock too, so once
+ * it returns no thread is still inside the previous sink and its `user` may be
+ * freed. The sink must not block. */
 typedef void (*log_sink_fn)(int level, const char *line, void *user);
 void log_set_sink(log_sink_fn fn, void *user);
 

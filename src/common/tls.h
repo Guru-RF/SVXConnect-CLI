@@ -90,7 +90,7 @@ void tls_consume(tls_conn_t *t, size_t n);
  * the TCP connection instead, which the server handles cleanly. */
 void tls_close(tls_conn_t *t);
 
-/* Last OpenSSL error as a string, for logging. */
+/* Last OpenSSL error as a string, for logging. The buffer is per thread. */
 const char *tls_last_error(void);
 
 #endif

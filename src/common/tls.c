@@ -29,7 +29,8 @@ void tls_global_init(void) {
 }
 
 const char *tls_last_error(void) {
-    static char buf[256];
+    /* Per thread: the connect worker and the main thread both format errors. */
+    static _Thread_local char buf[256];
     unsigned long e = ERR_get_error();
     if (!e) return "no OpenSSL error";
     ERR_error_string_n(e, buf, sizeof(buf));
