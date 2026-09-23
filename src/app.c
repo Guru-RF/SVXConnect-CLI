@@ -11,6 +11,7 @@
 #include "common/status.h"
 #include "common/util.h"
 #include "ctl/ctlfifo.h"
+#include "reflector/cert.h"
 #include "reflector/client.h"
 #include "tg/tgmanager.h"
 
@@ -21,6 +22,7 @@
 #include <signal.h>
 #include <unistd.h>
 #include <errno.h>
+#include <time.h>
 #include <poll.h>
 
 struct svx_app {
@@ -67,6 +69,12 @@ struct svx_app {
     /* A message the interface should show until the user dismisses it. */
     char              banner[240];
 
+    /* The certificate warning last raised, so it is raised once per change
+     * (the days-left count makes that once a day) and withdrawn after a
+     * renewal; and when the certificate was last looked at. */
+    char              cert_banner[240];
+    uint64_t          last_cert_check;
+
     /* Log ring, so the interface can show recent lines without reopening the
      * log file. Fed by the sink installed in app_new(). */
     app_log_line      logbuf[APP_LOG_LINES];
@@ -89,6 +97,33 @@ static void banner_set(svx_app *a, const char *msg) {
     notify(a);
 }
 
+/* Look at the certificate on disk and raise, or withdraw, its banner.
+ *
+ * The reflector renews the certificate by itself, so a banner here means that
+ * has not happened and a person has to act — the text says exactly what to do.
+ * Cheap enough (one small file) to run on every connection change. */
+static void cert_watch(svx_app *a) {
+    a->last_cert_check = now_ms();
+
+    cert_state cs;
+    char       text[240];
+    time_t     now = time(NULL);
+    cert_assess(a->cfg, now, &cs, 0);
+
+    if (cert_banner_text(a->cfg, &cs, now, text, sizeof(text))) {
+        if (strcmp(text, a->cert_banner) == 0) return;
+        snprintf(a->cert_banner, sizeof(a->cert_banner), "%s", text);
+        log_warn("%s", text);
+        banner_set(a, text);
+        return;
+    }
+    if (a->cert_banner[0]) {
+        /* Renewed. Clear our banner, but not one that has since replaced it. */
+        if (strcmp(a->banner, a->cert_banner) == 0) banner_set(a, NULL);
+        a->cert_banner[0] = '\0';
+    }
+}
+
 /* ------------------------------------------------------------ callbacks */
 
 static void hl_state(void *u, rc_state st, const char *detail) {
@@ -105,6 +140,10 @@ static void hl_state(void *u, rc_state st, const char *detail) {
         /* Whatever was queued belongs to a connection that no longer exists. */
         jitter_flush(&a->jb);
     }
+
+    /* Every login and every failed attempt: a renewal changes the file, and
+     * an expired certificate is exactly what makes attempts fail. */
+    if (st == RC_CONNECTED || st == RC_BACKOFF) cert_watch(a);
 }
 
 static void hl_talker_start(void *u, uint32_t tg, const char *call) {
@@ -643,6 +682,7 @@ void app_start(svx_app *a) {
 
     rc_start(a->rc);
     a->last_report = now_ms();
+    cert_watch(a);
     status_export(a);       /* publish an initial snapshot right away */
 }
 
@@ -701,6 +741,9 @@ void app_service(svx_app *a, uint64_t now) {
     /* Publish state for the panel widget. Self-throttling; catches connection,
      * talkgroup and PTT changes that reach here via rc_service and tx_pump. */
     status_export(a);
+
+    /* A session can outlast the warning threshold; look again hourly. */
+    if (now - a->last_cert_check >= 3600000) cert_watch(a);
 
     if (now - a->last_report >= 60000) {
         a->last_report = now;
