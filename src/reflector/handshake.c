@@ -27,8 +27,10 @@
 
 /* ------------------------------------------------------------- the flow */
 
+#define ABORTED(f) ((f) && atomic_load(f))
+
 int handshake_run(const svx_config *cfg, handshake_result *out,
-                  volatile sig_atomic_t *abort_flag) {
+                  const atomic_int *abort_flag) {
     uint8_t *buf = NULL;
 
     memset(out, 0, sizeof(*out));
@@ -67,8 +69,12 @@ int handshake_run(const svx_config *cfg, handshake_result *out,
     }
 
     /* ---- 3. TCP ---- */
-    out->tcp_fd = net_tcp_connect(out->host, out->port, HS_CONNECT_MS, NULL);
-    if (out->tcp_fd < 0) FAIL(out, "cannot reach %s:%u", out->host, out->port);
+    if (ABORTED(abort_flag)) FAIL(out, "cancelled");
+    out->tcp_fd = net_tcp_connect_ex(out->host, out->port, HS_CONNECT_MS, NULL, abort_flag);
+    if (out->tcp_fd < 0) {
+        if (errno == ECANCELED) FAIL(out, "cancelled");
+        FAIL(out, "cannot reach %s:%u (%s)", out->host, out->port, strerror(errno));
+    }
     log_info("connected to %s:%u", out->host, out->port);
 
     /* ---- 4. announce the protocol version, in the clear ---- */
@@ -81,9 +87,10 @@ int handshake_run(const svx_config *cfg, handshake_result *out,
      * advertises one, save it, and then ask for TLS. */
     int started_tls = 0;
     while (!started_tls) {
-        if (abort_flag && *abort_flag) FAIL(out, "cancelled");
+        if (ABORTED(abort_flag)) FAIL(out, "cancelled");
 
         ssize_t L = fio_raw_recv_frame(out->tcp_fd, buf, HS_BUF, HS_STEP_MS, abort_flag);
+        if (L < 0 && errno == ECANCELED) FAIL(out, "cancelled");
         if (L < 0) FAIL(out, "no response from %s (%s)", out->host, strerror(errno));
         if (L < 2) continue;
 
@@ -116,8 +123,12 @@ int handshake_run(const svx_config *cfg, handshake_result *out,
         case MSG_START_ENCRYPTION:
             out->ssl_ctx = tls_make_ctx(ca_path, cert_path, key_path);
             if (!out->ssl_ctx) FAIL(out, "cannot load the certificate for %s", cfg->callsign);
-            if (tls_start(&out->tls, out->ssl_ctx, out->tcp_fd) != 0)
+            if (tls_start_ex(&out->tls, out->ssl_ctx, out->tcp_fd, HS_STEP_MS, abort_flag) != 0) {
+                if (errno == ECANCELED) FAIL(out, "cancelled");
+                if (errno == ETIMEDOUT)
+                    FAIL(out, "TLS handshake with %s timed out", out->host);
                 FAIL(out, "TLS handshake with %s failed", out->host);
+            }
             started_tls = 1;
             break;
 
@@ -144,10 +155,17 @@ int handshake_run(const svx_config *cfg, handshake_result *out,
     /* ---- 6. over TLS: authenticate, learn our client id, set up UDP ---- */
     int got_server_info = 0, got_udp = 0;
     while (!(got_server_info && got_udp)) {
-        if (abort_flag && *abort_flag) FAIL(out, "cancelled");
+        if (ABORTED(abort_flag)) FAIL(out, "cancelled");
 
         ssize_t L = fio_tls_recv_frame(&out->tls, buf, HS_BUF, HS_STEP_MS, abort_flag);
-        if (L < 0) FAIL(out, "login failed (%s)", strerror(errno));
+        if (L < 0) {
+            if (errno == ECANCELED) FAIL(out, "cancelled");
+            if (tls_failed(&out->tls)) {
+                char why[200];
+                FAIL(out, "login failed (%s)", tls_close_describe(&out->tls, why, sizeof(why)));
+            }
+            FAIL(out, "login failed (%s)", strerror(errno));
+        }
         if (L < 2) continue;
 
         uint16_t type = be_get_u16(buf);

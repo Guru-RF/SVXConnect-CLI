@@ -15,6 +15,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <signal.h>
+#include <stdatomic.h>
 #include <unistd.h>
 #include <errno.h>
 
@@ -22,7 +23,9 @@
 #define EN_CONNECT_MS 10000
 #define EN_STEP_MS    20000
 
-static volatile sig_atomic_t g_stop;
+/* atomic_int rather than sig_atomic_t: frameio's abort flag is shared with
+ * the connect worker, and a lock-free atomic is just as signal-safe. */
+static atomic_int g_stop;
 
 static void on_signal(int sig) { (void)sig; g_stop = 1; }
 

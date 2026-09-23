@@ -44,7 +44,7 @@ struct rc_client {
     _Atomic int       worker_done;    /* worker sets (release); main reads (acquire) */
     handshake_result  worker_result;
     int               worker_rc;
-    volatile sig_atomic_t worker_abort;
+    atomic_int        worker_abort;   /* main sets; the worker polls it */
     int               wake_pipe[2];   /* worker -> main loop wakeup */
 
     /* timers */
@@ -116,10 +116,10 @@ static void drop_connection(rc_client *c) {
 
 static void join_worker(rc_client *c) {
     if (!c->worker_running) return;
-    c->worker_abort = 1;
+    atomic_store(&c->worker_abort, 1);
     pthread_join(c->worker, NULL);
     c->worker_running = 0;
-    c->worker_abort   = 0;
+    atomic_store(&c->worker_abort, 0);
     /* If it succeeded while we were tearing down, release what it produced. */
     if (c->worker_done && c->worker_rc == 0) handshake_release(&c->worker_result);
     c->worker_done = 0;
@@ -161,7 +161,7 @@ static void begin_connect(rc_client *c) {
     c->worker_result.tls.fd = -1;
     c->worker_rc    = -1;
     c->worker_done  = 0;
-    c->worker_abort = 0;
+    atomic_store(&c->worker_abort, 0);
 
     if (pthread_create(&c->worker, NULL, worker_main, c) != 0) {
         snprintf(c->last_error, sizeof(c->last_error), "cannot start the connect thread");
