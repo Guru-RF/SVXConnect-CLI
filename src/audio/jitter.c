@@ -151,6 +151,19 @@ void jitter_end_of_stream(svx_jitter *j) {
     if (j->state == JB_PLAYING) gate(j, 1);
 }
 
+void jitter_kick(svx_jitter *j) {
+    /* Audio queued locally (a beep) while nothing is being received. The gate
+     * is closed in IDLE, so without this it would sit in the ring until the
+     * next over and then play in front of it. last_audio_ms = 0 makes the
+     * drained ring a clean end rather than an underrun, and PLAYING closes the
+     * gate again once it is empty. PREFILL and PLAYING need nothing: an over
+     * is arriving and the beep plays out with it. */
+    if (j->state != JB_IDLE || svx_ring_avail(j->ring) == 0) return;
+    j->state         = JB_PLAYING;
+    j->last_audio_ms = 0;
+    gate(j, 1);
+}
+
 void jitter_flush(svx_jitter *j) {
     gate(j, 0);
     /* Clearing the ring is a tail operation, so the consumer does it. If there

@@ -354,6 +354,10 @@ static void tx_beep(svx_app *a, int count) {
         memset(gap, 0, sizeof(gap));
         if (b + 1 < count) svx_ring_write(&a->play_ring, gap, SVX_RATE / 16);
     }
+    /* Most beeps come while nothing is being received, when the jitter buffer
+     * keeps the output gated; without a kick they waited in the ring for the
+     * next over and played in front of it. */
+    jitter_kick(&a->jb);
 }
 
 /* Open the configured input device onto cap_ring. Not started. */
@@ -1031,8 +1035,7 @@ void app_test_tone(svx_app *a) {
         a->out_muted = 0;
         jitter_set_volume(&a->jb, 50);
     }
-    tx_beep(a, 2);
-    jitter_end_of_stream(&a->jb);   /* open the gate so it actually plays */
+    tx_beep(a, 2);                  /* which kicks the gate open so it plays */
 }
 
 /* ----------------------------------------------------------- accessors */

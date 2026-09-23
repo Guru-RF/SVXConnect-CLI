@@ -147,6 +147,34 @@ static void t_jitter_drop_requests_do_not_pile_up(void) {
     svx_ring_free(&r);
 }
 
+static void t_kick_plays_a_beep_while_idle(void) {
+    printf("jitter: audio queued while idle opens the gate\n");
+    svx_ring r; svx_ring_init(&r, 8192);
+    _Atomic float pk = 0;
+    svx_codec *c = codec_open();
+    svx_jitter j; jitter_init(&j, &r, c, 80);
+    svx_dev *d = svx_dev_open_playback("", &r, &pk);
+    jitter_set_device(&j, d);
+
+    jitter_kick(&j);
+    CHECK(fake_gate(d) == 0 && j.state == JB_IDLE, "nothing queued: stay idle and gated");
+
+    write_ramp(&r, 1, 2001);                  /* a beep */
+    jitter_kick(&j);
+    CHECK(fake_gate(d) == 1, "the gate must open so the beep plays now");
+    CHECK(j.state == JB_PLAYING, "state %s", jitter_state_name(&j));
+
+    /* Drained: back to idle cleanly, not counted as an underrun. */
+    svx_ring_reset(&r);
+    jitter_tick(&j, 10000);
+    CHECK(j.state == JB_IDLE && fake_gate(d) == 0 && j.n_underruns == 0,
+          "after the beep: idle, gated, no underrun (state %s, underruns %llu)",
+          jitter_state_name(&j), (unsigned long long)j.n_underruns);
+    svx_dev_close(d);
+    codec_close(c);
+    svx_ring_free(&r);
+}
+
 int main(void) {
     log_set_level(LOG_ERR);
     printf("\nplayback fixtures\n\n");
@@ -156,6 +184,7 @@ int main(void) {
     t_trim_partly_played();
     t_jitter_trim_via_device();
     t_jitter_drop_requests_do_not_pile_up();
+    t_kick_plays_a_beep_while_idle();
     printf("\n%d checks, %d failed\n\n", g_run, g_fail);
     return g_fail ? 1 : 0;
 }

@@ -80,6 +80,10 @@ void jitter_tick(svx_jitter *j, uint64_t now);
 /* A transmission ended: let what is buffered drain, but stop expecting more. */
 void jitter_end_of_stream(svx_jitter *j);
 
+/* Audio was queued straight into the ring (a beep, the test tone): make sure
+ * it plays now, even though no over is being received. */
+void jitter_kick(svx_jitter *j);
+
 /* Throw everything away — a talkgroup change, so what is queued belongs to
  * the talkgroup we just left. */
 void jitter_flush(svx_jitter *j);

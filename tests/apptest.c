@@ -197,6 +197,20 @@ static void t_dead_speaker_gives_up_with_banner(void) {
     app_free(a);
 }
 
+static void t_beep_while_idle_plays(void) {
+    printf("RX: a beep while nothing is received plays now, not before the next over\n");
+    svx_app *a = start_app();
+    run_for(a, 50);
+
+    stub_rc_set_state(RC_IDLE);
+    app_ptt(a, CTL_ON);                           /* refused: 3 beeps */
+    CHECK(fake_gate(fake_current(0)) == 1, "the output gate must open for the beep");
+    run_for(a, 800);
+    CHECK(app_jitter_ms(a) == 0, "the beep should have played out, %u ms still queued",
+          app_jitter_ms(a));
+    app_free(a);
+}
+
 int main(void) {
     log_set_level(LOG_INFO);
     log_set_sink(sink, NULL);
@@ -210,6 +224,7 @@ int main(void) {
     t_stale_idle_event_ignored();
     t_dead_speaker_is_reopened();
     t_dead_speaker_gives_up_with_banner();
+    t_beep_while_idle_plays();
 
     printf("\n%d checks, %d failed\n\n", g_run, g_fail);
     return g_fail ? 1 : 0;
