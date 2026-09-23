@@ -197,6 +197,20 @@ static void t_dead_speaker_gives_up_with_banner(void) {
     app_free(a);
 }
 
+static void t_other_station_takes_the_floor(void) {
+    printf("TX: another station given our talkgroup while keyed un-keys us\n");
+    svx_app *a = start_app();
+
+    app_ptt(a, CTL_ON);
+    run_for(a, 50);
+    stub_rc_talker_start(8, "ON3TST-1");          /* our own echo, other SSID */
+    CHECK(app_tx_active(a), "our own talker start must not un-key us");
+    stub_rc_talker_start(8, "ON4XYZ");
+    CHECK(!app_tx_active(a), "someone else has the floor: un-key");
+    CHECK(logged(LOG_WARN, "ON4XYZ"), "and say who");
+    app_free(a);
+}
+
 static void t_beep_while_idle_plays(void) {
     printf("RX: a beep while nothing is received plays now, not before the next over\n");
     svx_app *a = start_app();
@@ -224,6 +238,7 @@ int main(void) {
     t_stale_idle_event_ignored();
     t_dead_speaker_is_reopened();
     t_dead_speaker_gives_up_with_banner();
+    t_other_station_takes_the_floor();
     t_beep_while_idle_plays();
 
     printf("\n%d checks, %d failed\n\n", g_run, g_fail);

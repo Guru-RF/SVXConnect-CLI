@@ -110,6 +110,7 @@ struct svx_app {
 };
 
 static void tx_stop(svx_app *a, const char *why);
+static void tx_beep(svx_app *a, int count);
 
 static void notify(svx_app *a) {
     if (a->observer) a->observer(a->observer_user);
@@ -141,6 +142,22 @@ static void hl_state(void *u, rc_state st, const char *detail) {
 static void hl_talker_start(void *u, uint32_t tg, const char *call) {
     svx_app *a = u;
     log_info("TALKER START  TG %-6u %s", tg, call);
+
+    /* Someone else was given our talkgroup while we are keyed. The reflector
+     * hands the floor to whoever's audio arrives first, so ours is not being
+     * relayed: carrying on only talks into a void (and hides a microphone that
+     * is sending nothing, which is how this was found). */
+    if (a->tx_active && tg == tgm_selected(&a->tgm)) {
+        char mine[64], theirs[64];
+        call_strip_ssid(mine,   sizeof(mine),   a->cfg->callsign);
+        call_strip_ssid(theirs, sizeof(theirs), call);
+        if (strcmp(mine, theirs) != 0) {
+            log_warn("the reflector gave TG %u to %s while we were keyed — un-keying",
+                     tg, call);
+            tx_stop(a, "another station has the talkgroup");
+            tx_beep(a, 2);
+        }
+    }
 
     /* The manager tracks every active talker on every watched talkgroup; the
      * PTT busy-guard reads that, so nothing extra needs recording here. */
