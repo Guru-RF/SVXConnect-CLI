@@ -171,10 +171,22 @@ $(BUILD)/cryptotest: $(CRYPTO_TEST_OBJ)
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $^ -lssl -lcrypto -lm
 
-test: $(BUILD)/tgtest $(BUILD)/cryptotest $(BUILD)/conftest
+# The status file and the control FIFO: what other local programs see.
+LOCAL_TEST_OBJ := $(BUILD)/tests/localtest.o \
+                  $(BUILD)/src/common/status.o \
+                  $(BUILD)/src/ctl/ctlfifo.o \
+                  $(BUILD)/src/common/log.o \
+                  $(BUILD)/src/common/util.o
+
+$(BUILD)/localtest: $(LOCAL_TEST_OBJ)
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $^ -lm
+
+test: $(BUILD)/tgtest $(BUILD)/cryptotest $(BUILD)/conftest $(BUILD)/localtest
 	@$(BUILD)/tgtest
 	@$(BUILD)/cryptotest
 	@$(BUILD)/conftest
+	@$(BUILD)/localtest
 
 asan:
 	$(MAKE) clean
