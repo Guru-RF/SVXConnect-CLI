@@ -65,6 +65,7 @@ typedef struct {
     int              rc;
     handshake_result result;
     svx_config       cfg;
+    char             rejected_fp[65]; /* copy of rc_client.cert_rejected */
 } rc_job;
 
 struct rc_client {
@@ -81,6 +82,11 @@ struct rc_client {
     uint64_t          last_udp_rx;   /* last authenticated datagram     */
     int               rx_timeout_ms; /* 0 disables the watchdog         */
     int               rekey_needed;  /* the UDP counter ran out         */
+
+    /* The certificate the reflector refused in a TLS handshake. Kept across
+     * attempts, so that every later login goes without it and asks for a new
+     * one, until one is stored or the file on disk changes. */
+    char              cert_rejected[65];
 
     /* The reflector's most recent MsgError, kept to explain a close. */
     char              server_error[256];
@@ -243,7 +249,7 @@ void rc_free(rc_client *c) {
 
 static void *worker_main(void *arg) {
     rc_job *j = arg;
-    j->rc = handshake_run(&j->cfg, &j->result, &j->abort);
+    j->rc = handshake_run_ex(&j->cfg, &j->result, &j->abort, j->rejected_fp);
 
     /* Publish the result, then flag done with a RELEASE store, then wake the
      * loop. The main thread reads `done` with an acquire load, which is what
@@ -270,6 +276,7 @@ static void begin_connect(rc_client *c) {
     j->wake_fd = c->wake_pipe[1];
     j->rc      = -1;
     j->cfg     = *c->cfg;
+    snprintf(j->rejected_fp, sizeof(j->rejected_fp), "%s", c->cert_rejected);
     reset_result(&j->result);
 
     pthread_attr_t at;
@@ -712,6 +719,7 @@ static void adopt_connection(rc_client *c, handshake_result *r) {
     c->conn_since  = c->last_tcp_rx = c->last_udp_rx = now;
     c->rekey_needed    = 0;
     c->server_error[0] = '\0';
+    c->cert_rejected[0] = '\0';     /* whatever we presented was taken */
 
     /* Restore the talkgroup state the user had before the drop, in the same
      * order the protocol requires: select first, monitor second. */
@@ -773,6 +781,14 @@ void rc_service(rc_client *c, uint64_t now) {
             /* A certificate stored during login ends that login on purpose;
              * the retry should be the shortest one, not the next step up. */
             if (j->result.cert_renewed) c->backoff_idx = 0;
+            /* Refused: the next attempt asks for a new certificate, and
+             * should come as soon as a renewal's would. */
+            if (j->result.cert_rejected[0]) {
+                snprintf(c->cert_rejected, sizeof(c->cert_rejected), "%s",
+                         j->result.cert_rejected);
+                c->backoff_idx = 0;
+            }
+            if (j->result.cert_renewed || j->result.cert_retry) c->cert_rejected[0] = '\0';
             enter_backoff(c, j->result.err[0] ? j->result.err : "connection failed");
         }
         pthread_mutex_lock(&j->mu);

@@ -103,11 +103,58 @@ static void set_closed(tls_conn_t *t, tls_close_kind k, const char *detail) {
     t->failed = 1;
 }
 
+/* A certificate-related alert from the peer. SvxLink-Broadcast's rule, and
+ * the alerts svxreflector sends when it will not take the certificate we
+ * presented: expired or revoked on its side, signed by a CA it no longer
+ * trusts, or simply unknown to it. */
+static int err_is_cert_alert(unsigned long err) {
+    if (ERR_GET_LIB(err) != ERR_LIB_SSL) return 0;
+    switch (ERR_GET_REASON(err)) {
+#ifdef SSL_R_SSLV3_ALERT_BAD_CERTIFICATE
+    case SSL_R_SSLV3_ALERT_BAD_CERTIFICATE:
+#endif
+#ifdef SSL_R_SSLV3_ALERT_UNSUPPORTED_CERTIFICATE
+    case SSL_R_SSLV3_ALERT_UNSUPPORTED_CERTIFICATE:
+#endif
+#ifdef SSL_R_SSLV3_ALERT_CERTIFICATE_REVOKED
+    case SSL_R_SSLV3_ALERT_CERTIFICATE_REVOKED:
+#endif
+#ifdef SSL_R_SSLV3_ALERT_CERTIFICATE_EXPIRED
+    case SSL_R_SSLV3_ALERT_CERTIFICATE_EXPIRED:
+#endif
+#ifdef SSL_R_SSLV3_ALERT_CERTIFICATE_UNKNOWN
+    case SSL_R_SSLV3_ALERT_CERTIFICATE_UNKNOWN:
+#endif
+#ifdef SSL_R_TLSV1_ALERT_UNKNOWN_CA
+    case SSL_R_TLSV1_ALERT_UNKNOWN_CA:
+#endif
+#ifdef SSL_R_TLSV1_ALERT_ACCESS_DENIED
+    case SSL_R_TLSV1_ALERT_ACCESS_DENIED:
+#endif
+#ifdef SSL_R_TLSV13_ALERT_CERTIFICATE_REQUIRED
+    case SSL_R_TLSV13_ALERT_CERTIFICATE_REQUIRED:
+#endif
+        return 1;
+    default:
+        return 0;
+    }
+}
+
 /* Classify a failed SSL_read/SSL_write/SSL_connect. `sys_errno` is errno as
  * it was straight after the call — SSL_get_error() may clobber it. */
 static void classify_failure(tls_conn_t *t, int ssl_err, int sys_errno, const char *op) {
-    unsigned long e = ERR_peek_last_error();
-    const char *reason = e ? ERR_reason_error_string(e) : NULL;
+    /* Drain the error queue once: the certificate alert need not be its last
+     * entry, and OpenSSL has no way to look further in than the ends. Keep
+     * the first entry's text for the log and the last one's reason. */
+    char          first[256] = "";
+    const char   *reason     = NULL;
+    unsigned long e = 0, q;
+    while ((q = ERR_get_error()) != 0) {
+        if (!first[0]) ERR_error_string_n(q, first, sizeof(first));
+        if (err_is_cert_alert(q)) t->cert_rejected = 1;
+        e = q;
+    }
+    if (e) reason = ERR_reason_error_string(e);
 
     if (ssl_err == SSL_ERROR_ZERO_RETURN) {
         log_dbg("TLS closed by peer (close_notify) while %s", op);
@@ -129,13 +176,14 @@ static void classify_failure(tls_conn_t *t, int ssl_err, int sys_errno, const ch
         log_dbg("TLS socket error while %s: %s", op, strerror(sys_errno));
         set_closed(t, TLS_CLOSE_NETWORK, strerror(sys_errno));
     } else {
-        log_dbg("TLS error while %s: %s", op, tls_last_error());
+        log_dbg("TLS error while %s: %s", op, first[0] ? first : "no OpenSSL error");
         set_closed(t, TLS_CLOSE_ALERT, reason ? reason : "protocol error");
     }
-    ERR_clear_error();
 }
 
 int tls_failed(const tls_conn_t *t) { return t->failed; }
+
+int tls_cert_rejected(const tls_conn_t *t) { return t->cert_rejected; }
 
 const char *tls_close_describe(const tls_conn_t *t, char *buf, size_t cap) {
     const char *d = t->close_detail[0] ? t->close_detail : "unknown";
@@ -381,6 +429,7 @@ void tls_close(tls_conn_t *t) {
     t->handshake_done = 0;
     t->want_write     = 0;
     t->failed         = 0;
+    t->cert_rejected  = 0;
     t->close_kind     = TLS_CLOSE_NONE;
     t->close_detail[0] = '\0';
     t->ctx            = NULL;   /* not ours to free */

@@ -39,6 +39,12 @@ typedef struct {
 
     int                 cert_renewed; /* failed only because a new certificate
                                          was just stored: reconnect at once */
+    char                cert_rejected[65]; /* fingerprint of the certificate the
+                                              reflector refused in the TLS
+                                              handshake; "" otherwise */
+    int                 cert_retry;   /* the reflector handed back the very
+                                         certificate it refused: present it
+                                         again next time */
     char                err[256];     /* human-readable failure reason */
 } handshake_result;
 
@@ -51,6 +57,15 @@ typedef struct {
  */
 int handshake_run(const svx_config *cfg, handshake_result *out,
                   const atomic_int *abort_flag);
+
+/* handshake_run(), told which certificate the reflector refused last time
+ * (its fingerprint, from out->cert_rejected of an earlier attempt; NULL or ""
+ * for none). While that certificate is still the one on disk it is not
+ * presented: the login goes without it, and the reflector's CSR request is
+ * answered from the same key — the way an expired certificate is replaced.
+ * A certificate that changed on disk in the meantime is presented as usual. */
+int handshake_run_ex(const svx_config *cfg, handshake_result *out,
+                     const atomic_int *abort_flag, const char *rejected_fp);
 
 /* Release everything a successful handshake_run() produced. */
 void handshake_release(handshake_result *r);

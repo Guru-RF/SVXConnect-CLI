@@ -33,6 +33,11 @@
 
 int handshake_run(const svx_config *cfg, handshake_result *out,
                   const atomic_int *abort_flag) {
+    return handshake_run_ex(cfg, out, abort_flag, NULL);
+}
+
+int handshake_run_ex(const svx_config *cfg, handshake_result *out,
+                     const atomic_int *abort_flag, const char *rejected_fp) {
     uint8_t *buf = NULL;
 
     memset(out, 0, sizeof(*out));
@@ -77,8 +82,28 @@ int handshake_run(const svx_config *cfg, handshake_result *out,
     if (pki_check_pair(cs.cert_path, cs.key_path) != 0) {
         FAIL(out, "the certificate and key in %s do not match", cfg->pki_dir);
     }
-    const int present_cert = (cs.status != PKI_CERT_EXPIRED);
+    /* A certificate the reflector refused in an earlier TLS handshake is
+     * left out just like an expired one, while it is still the one on disk:
+     * we cannot tell what is wrong with it from here (revoked or removed on
+     * the reflector, or a clock that disagrees), only that it will not do. */
+    const int refused = rejected_fp && rejected_fp[0] && cs.info.fingerprint[0] &&
+                        strcmp(cs.info.fingerprint, rejected_fp) == 0;
+    const int present_cert = (cs.status != PKI_CERT_EXPIRED) && !refused;
     int       sent_csr     = 0;
+    if (refused)
+        log_info("not presenting the certificate the reflector refused; "
+                 "asking it for a new one with the same key");
+
+    /* What the new certificate is for, in the failure the user sees while
+     * the request waits for the sysop. */
+    char need[96];
+    if (refused) {
+        snprintf(need, sizeof(need), "the reflector refused our certificate");
+    } else {
+        char na[32];
+        pki_format_time(cs.info.not_after, na, sizeof(na));
+        snprintf(need, sizeof(need), "certificate expired on %s", na);
+    }
 
     /* ---- 3. TCP ---- */
     if (ABORTED(abort_flag)) FAIL(out, "cancelled");
@@ -141,7 +166,25 @@ int handshake_run(const svx_config *cfg, handshake_result *out,
                 if (errno == ECANCELED) FAIL(out, "cancelled");
                 if (errno == ETIMEDOUT)
                     FAIL(out, "TLS handshake with %s timed out", out->host);
-                FAIL(out, "TLS handshake with %s failed", out->host);
+                char why[200];
+                tls_close_describe(&out->tls, why, sizeof(why));
+                if (present_cert && tls_cert_rejected(&out->tls)) {
+                    /* It looks valid here, yet the reflector will not have
+                     * it. Retrying with it can only fail the same way, so
+                     * the next attempt asks for a new one instead. */
+                    char na[32];
+                    pki_format_time(cs.info.not_after, na, sizeof(na));
+                    log_warn("the reflector refused our certificate in the TLS handshake (%s), "
+                             "although it is valid here until %s. It may have been revoked or "
+                             "removed on the reflector, or one of the two clocks is wrong. "
+                             "Asking the reflector for a new certificate with the same key.",
+                             why, na);
+                    snprintf(out->cert_rejected, sizeof(out->cert_rejected), "%s",
+                             cs.info.fingerprint);
+                    FAIL(out, "the reflector refused our certificate (%s) — requesting a new one",
+                         why);
+                }
+                FAIL(out, "TLS handshake with %s failed (%s)", out->host, why);
             }
             started_tls = 1;
             break;
@@ -178,10 +221,8 @@ int handshake_run(const svx_config *cfg, handshake_result *out,
                 /* The reflector hangs up after taking a request it cannot sign
                  * by itself. That is the normal answer until the sysop has
                  * signed. */
-                char na[32];
-                pki_format_time(cs.info.not_after, na, sizeof(na));
-                FAIL(out, "certificate expired on %s; new one requested — waiting for "
-                     "the reflector sysop to sign it", na);
+                FAIL(out, "%s; new one requested — waiting for "
+                     "the reflector sysop to sign it", need);
             }
             if (tls_failed(&out->tls)) {
                 char why[200];
@@ -306,10 +347,17 @@ int handshake_run(const svx_config *cfg, handshake_result *out,
                 FAIL(out, "new certificate stored — reconnecting to use it");
             }
             if (r == PKI_PUSH_EMPTY && sent_csr) {
-                char na[32];
-                pki_format_time(cs.info.not_after, na, sizeof(na));
-                FAIL(out, "certificate expired on %s; new one requested — waiting "
-                     "for the reflector sysop to sign it", na);
+                FAIL(out, "%s; new one requested — waiting "
+                     "for the reflector sysop to sign it", need);
+            }
+            if (r == PKI_PUSH_SAME && refused) {
+                /* It refused this certificate and then hands it back as
+                 * current. Try it once more, as SvxLink-Broadcast does: a
+                 * reflector that reloaded its CA may take it now. */
+                out->cert_retry = 1;
+                FAIL(out, "the reflector refused our certificate but sends the same one back — "
+                     "check the clock here and on the reflector, or ask its sysop to remove "
+                     "and re-sign the certificate for %s", cfg->callsign);
             }
             FAIL(out, "the reflector sent an unusable certificate — see the log");
         }

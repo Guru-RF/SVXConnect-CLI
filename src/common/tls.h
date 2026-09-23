@@ -56,6 +56,8 @@ typedef struct {
 
     tls_close_kind close_kind; /* set together with `failed`                   */
     char           close_detail[160];   /* errno text or OpenSSL reason     */
+    int            cert_rejected;       /* the peer's alert refused our
+                                           client certificate               */
 } tls_conn_t;
 
 void tls_global_init(void);
@@ -106,6 +108,13 @@ int tls_pump_in(tls_conn_t *t);
 
 /* Non-zero once the connection is unusable; close_kind says why. */
 int tls_failed(const tls_conn_t *t);
+
+/* Non-zero when the connection failed on a certificate-related TLS alert from
+ * the peer (bad, unsupported, revoked, expired or unknown certificate, unknown
+ * CA, access denied). That is how svxreflector turns away a client
+ * certificate it does not accept — also one that looks perfectly valid here.
+ * Still readable after tls_start_ex() fails. */
+int tls_cert_rejected(const tls_conn_t *t);
 
 /* close_kind and close_detail as one short phrase, e.g. "TLS close_notify",
  * "ECONNRESET" or "TLS error: sslv3 alert certificate expired". Writes into

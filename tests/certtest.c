@@ -155,15 +155,21 @@ static int same_file(const char *path, const char *want) {
     return r;
 }
 
+/* Into the caller's buffer: the fake reflector's thread takes fingerprints
+ * too, while the test's thread does. */
+static char *fingerprint_into(X509 *x, char fp[65]) {
+    unsigned char md[EVP_MAX_MD_SIZE];
+    unsigned int  n = 0;
+    fp[0] = '\0';
+    X509_digest(x, EVP_sha256(), md, &n);
+    for (unsigned i = 0; i < n && i < 32; i++) snprintf(fp + i * 2, 3, "%02x", md[i]);
+    return fp;
+}
+
 static char *fingerprint(X509 *x) {
     static char out[4][65];
     static int  slot;
-    char *fp = out[slot++ & 3];
-    unsigned char md[EVP_MAX_MD_SIZE];
-    unsigned int  n = 0;
-    X509_digest(x, EVP_sha256(), md, &n);
-    for (unsigned i = 0; i < n; i++) snprintf(fp + i * 2, 3, "%02x", md[i]);
-    return fp;
+    return fingerprint_into(x, out[slot++ & 3]);
 }
 
 /* Shared material: one CA, the node's key and a stranger's key. */
@@ -425,6 +431,8 @@ typedef struct {
     int         sign_csr;      /* sign a CSR and send it back */
     EVP_PKEY   *sign_pub_key;  /* ...but certify this key instead of the CSR's */
     char       *push_pem;      /* push this once, after a login with a certificate */
+    char        refuse_fp[65]; /* turn this certificate away in the TLS handshake,
+                                  with a certificate_revoked alert */
 
     /* what it saw; read by the test after fr_stop() or under mu */
     pthread_mutex_t mu;
@@ -432,6 +440,8 @@ typedef struct {
     char        presented[8][65];   /* fingerprint per session, "" for none */
     char        csr[8192];
     int         got_csr, pushed;
+    int         refused;            /* handshakes turned away over refuse_fp */
+    int         cur;                /* the session being served            */
 } fakerefl;
 
 static int rd_exact(SSL *ssl, int fd, uint8_t *p, size_t n, int timeout_ms, _Atomic int *stop) {
@@ -502,7 +512,27 @@ static char *sign_csr_pem(const char *csr_pem, EVP_PKEY *instead) {
     return pem;
 }
 
-static int accept_any(int ok, X509_STORE_CTX *c) { (void)ok; (void)c; return 1; }
+/* Take whatever certificate comes — the test wants to see what the client
+ * presents, expired or not — except the one named in refuse_fp, which is
+ * refused the way svxreflector refuses a revoked or removed certificate. */
+static int accept_any(int ok, X509_STORE_CTX *c) {
+    (void)ok;
+    if (X509_STORE_CTX_get_error_depth(c) != 0) return 1;
+    SSL      *ssl = X509_STORE_CTX_get_ex_data(c, SSL_get_ex_data_X509_STORE_CTX_idx());
+    fakerefl *f   = ssl ? SSL_get_app_data(ssl) : NULL;
+    X509     *x   = X509_STORE_CTX_get_current_cert(c);
+    if (!f || !x) return 1;
+    char fp[65];
+    fingerprint_into(x, fp);
+    int refuse = 0;
+    pthread_mutex_lock(&f->mu);
+    snprintf(f->presented[f->cur], 65, "%s", fp);
+    if (f->refuse_fp[0] && strcmp(fp, f->refuse_fp) == 0) { refuse = 1; f->refused++; }
+    pthread_mutex_unlock(&f->mu);
+    if (!refuse) return 1;
+    X509_STORE_CTX_set_error(c, X509_V_ERR_CERT_REVOKED);
+    return 0;
+}
 
 static void serve(fakerefl *f, int fd) {
     uint8_t *buf = malloc(64 * 1024);
@@ -512,6 +542,7 @@ static void serve(fakerefl *f, int fd) {
 
     pthread_mutex_lock(&f->mu);
     idx = f->sessions < 8 ? f->sessions : 7;
+    f->cur = idx;
     f->sessions++;
     pthread_mutex_unlock(&f->mu);
 
@@ -526,11 +557,14 @@ static void serve(fakerefl *f, int fd) {
 
     ssl = SSL_new(f->ctx);
     SSL_set_fd(ssl, fd);
+    SSL_set_app_data(ssl, f);
     if (SSL_accept(ssl) != 1) goto out;
 
     X509 *peer = SSL_get_peer_certificate(ssl);
+    char  pfp[65] = "";
+    if (peer) fingerprint_into(peer, pfp);
     pthread_mutex_lock(&f->mu);
-    snprintf(f->presented[idx], 65, "%s", peer ? fingerprint(peer) : "");
+    snprintf(f->presented[idx], 65, "%s", pfp);
     pthread_mutex_unlock(&f->mu);
 
     if (!peer) {
@@ -602,8 +636,7 @@ static void fr_start(fakerefl *f) {
     SSL_CTX_use_certificate(f->ctx, sc);
     SSL_CTX_use_PrivateKey(f->ctx, sk);
     X509_free(sc);
-    /* Ask for a client certificate but take whatever comes: the test wants to
-     * see what the client presents, expired or not. */
+    /* Ask for a client certificate; accept_any decides what to do with it. */
     SSL_CTX_set_verify(f->ctx, SSL_VERIFY_PEER, accept_any);
 
     f->lfd = socket(AF_INET, SOCK_STREAM, 0);
@@ -703,6 +736,7 @@ static void t_expired_login_unsigned(void) {
 
 /* ------------------------------------------- renewal pushed mid-session */
 
+
 typedef struct { int connected; int closed_msgs; } rc_obs;
 
 static void obs_state(void *u, rc_state st, const char *detail) {
@@ -757,6 +791,116 @@ static void t_midsession_push(int good) {
         CHECK(f.pushed == 1, "(the push did happen)");
     }
     free(f.push_pem);
+    free(old);
+    rm_dir();
+}
+
+/* ------------------------------------ refused in the TLS handshake */
+
+/* A certificate that is valid by our clock, but the reflector will not have
+ * it: revoked or removed there, or its clock disagrees. It says so with a
+ * certificate alert in the TLS handshake. The login must recognise that, say
+ * it plainly, and go the way of an expired certificate: no certificate, and a
+ * request from the same key. */
+static void t_refused_login_requests_new_cert(int signed_) {
+    printf(signed_ ? "cert: a certificate the reflector refuses in TLS is replaced through a request\n"
+                   : "cert: a refused certificate with nothing signed yet says so\n");
+    fresh_dir();
+    char *old = install_cert(-10 * DAY, 80 * DAY);       /* healthy, by our clock */
+    X509 *ox  = NULL;
+    { FILE *fp = fopen(g_crt, "r"); ox = PEM_read_X509(fp, NULL, NULL, NULL); fclose(fp); }
+    char old_fp[65];
+    fingerprint_into(ox, old_fp);
+    X509_free(ox);
+
+    fakerefl f;
+    fr_start(&f);
+    f.sign_csr = signed_;
+    snprintf(f.refuse_fp, sizeof(f.refuse_fp), "%s", old_fp);
+    fr_run(&f);
+
+    handshake_result r;
+    log_reset();
+    int rc = handshake_run(&g_cfg, &r, NULL);
+    CHECK(rc != 0 && strcmp(r.cert_rejected, old_fp) == 0,
+          "the login fails and names the refused certificate (%s)", r.err);
+    CHECK(strstr(r.err, "refused our certificate") && strstr(r.err, "revoked"),
+          "the reason says the reflector refused it, and how: %s", r.err);
+    CHECK(log_has("refused our certificate in the TLS handshake") && log_has("same key"),
+          "the log explains it and says what happens next");
+
+    /* The next attempt, told what was refused, goes without it. */
+    handshake_result r2;
+    log_reset();
+    rc = handshake_run_ex(&g_cfg, &r2, NULL, r.cert_rejected);
+    CHECK(rc != 0, "the second login ends too (%s)", r2.err);
+    CHECK(log_has("not presenting the certificate the reflector refused"), "and says why");
+
+    fr_stop(&f);
+    CHECK(f.refused == 1 && f.sessions == 2, "one refusal in two sessions (%d, %d)",
+          f.refused, f.sessions);
+    CHECK(strcmp(f.presented[0], old_fp) == 0, "the first presented the certificate");
+    CHECK(f.presented[1][0] == '\0', "the second presented none");
+    CHECK(f.got_csr == 1 && csr_pubkey_is_ours(), "and sent a request from our key");
+    CHECK(same_file(g_key_path, g_key_pem), "the key was not replaced");
+    if (signed_) {
+        CHECK(r2.cert_renewed, "the signed certificate was stored");
+        CHECK(!same_file(g_crt, old), "the refused certificate on disk was replaced");
+    } else {
+        CHECK(!r2.cert_renewed && strstr(r2.err, "refused our certificate") &&
+              strstr(r2.err, "sysop"), "the wait for the sysop is explained: %s", r2.err);
+        CHECK(same_file(g_crt, old), "the certificate on disk is kept");
+    }
+    free(old);
+    rm_dir();
+}
+
+/* The same through the client, which owns the state between attempts: it
+ * must remember the refusal across connects, and forget it once a new
+ * certificate is in. */
+static void t_refused_across_attempts(void) {
+    printf("cert: the client remembers a refused certificate across attempts, until it is replaced\n");
+    fresh_dir();
+    char *old = install_cert(-10 * DAY, 80 * DAY);
+    X509 *ox  = NULL;
+    { FILE *fp = fopen(g_crt, "r"); ox = PEM_read_X509(fp, NULL, NULL, NULL); fclose(fp); }
+    char old_fp[65];
+    fingerprint_into(ox, old_fp);
+    X509_free(ox);
+
+    fakerefl f;
+    fr_start(&f);
+    f.sign_csr = 1;
+    snprintf(f.refuse_fp, sizeof(f.refuse_fp), "%s", old_fp);
+    fr_run(&f);
+
+    rc_obs obs = { 0 };
+    rc_callbacks cb = { .user = &obs, .on_state = obs_state };
+    rc_client *rc = rc_new(&g_cfg, &cb);
+    rc_start(rc);
+    uint64_t until = now_ms() + 12000;
+    while (now_ms() < until && obs.connected < 1) {
+        struct pollfd p[8];
+        int n = rc_poll_fds(rc, p, 8);
+        poll(p, (nfds_t)n, 50);
+        rc_service(rc, now_ms());
+    }
+    rc_stop(rc, "test over");
+    rc_free(rc);
+    fr_stop(&f);
+
+    char new_fp[65] = "";
+    X509 *nx = NULL;
+    { FILE *fp = fopen(g_crt, "r"); nx = PEM_read_X509(fp, NULL, NULL, NULL); fclose(fp); }
+    if (nx) { fingerprint_into(nx, new_fp); X509_free(nx); }
+
+    CHECK(obs.connected == 1, "the client logged in in the end (%d)", obs.connected);
+    CHECK(f.sessions == 3, "in three sessions: refused, request, login (%d)", f.sessions);
+    CHECK(f.refused == 1, "the refused certificate was offered once only (%d)", f.refused);
+    CHECK(f.presented[1][0] == '\0', "the attempt after the refusal presented none");
+    CHECK(strcmp(new_fp, old_fp) != 0 && strcmp(f.presented[2], new_fp) == 0,
+          "the login after the renewal presented the new certificate");
+    CHECK(same_file(g_key_path, g_key_pem), "with the same key");
     free(old);
     rm_dir();
 }
@@ -841,6 +985,9 @@ int main(void) {
     t_expired_login_unsigned();
     t_midsession_push(1);
     t_midsession_push(0);
+    t_refused_login_requests_new_cert(1);
+    t_refused_login_requests_new_cert(0);
+    t_refused_across_attempts();
     t_enroll_expired();
     t_enroll_wrong_cert();
 
