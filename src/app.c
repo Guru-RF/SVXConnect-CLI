@@ -6,6 +6,7 @@
 #include "audio/codec.h"
 #include "audio/dev.h"
 #include "audio/jitter.h"
+#include "audio/watchdog.h"
 #include "common/log.h"
 #include "common/ring.h"
 #include "common/status.h"
@@ -23,6 +24,30 @@
 #include <errno.h>
 #include <poll.h>
 
+/* Audio device watchdog timings (see audio/watchdog.h for why there is one).
+ *
+ * Capture: a healthy stream delivers its first samples 6-36 ms after the
+ * start on PipeWire, then every 20 ms. Half a second of nothing is a stall,
+ * and short enough that the over is rescued before anyone notices the gap.
+ * One reopen; if that yields nothing too, stop rather than transmit a void.
+ *
+ * Playback runs all the time, so a slower trigger costs nothing and keeps a
+ * busy machine from reopening a device that was only late. After a reopen that
+ * does not help, keep trying at PLAY_RETRY_MS: receive is otherwise dead for
+ * good, as it was for 31 hours once. */
+#define CAP_GRACE_MS      500
+#define CAP_STALL_MS      500
+#define PLAY_GRACE_MS    1000
+#define PLAY_STALL_MS    1000
+#define PLAY_RETRY_MS   30000
+
+/* An over this long that sent nothing is reported, not just counted. */
+#define TX_NO_AUDIO_MS    200
+
+static const char PLAY_STALLED_BANNER[] =
+    "SPEAKER STALLED - the output device stopped playing and reopening it did not "
+    "help, so received audio is not heard. Still retrying. 'x' dismisses.";
+
 struct svx_app {
     const svx_config *cfg;
     rc_client        *rc;
@@ -34,6 +59,9 @@ struct svx_app {
     svx_jitter        jb;
     _Atomic float     spk_peak;
     int               audio_ready;
+    svx_watchdog      play_wd;
+    int               play_stalled;   /* gave up on the output; retrying slowly */
+    uint64_t          play_retry_ms;
 
     /* transmit path */
     svx_codec        *tx_codec;
@@ -45,6 +73,9 @@ struct svx_app {
     int               tx_active;
     uint64_t          tx_started_ms;
     uint64_t          tx_frames;
+    uint64_t          tx_encode_fails;
+    int               tx_saw_sound;   /* a device reopened mid-over heard sound */
+    svx_watchdog      cap_wd;
     int16_t           tx_pcm[SVX_FRAME];
 
     tg_manager        tgm;
@@ -110,6 +141,7 @@ static void hl_state(void *u, rc_state st, const char *detail) {
 static void hl_talker_start(void *u, uint32_t tg, const char *call) {
     svx_app *a = u;
     log_info("TALKER START  TG %-6u %s", tg, call);
+
     /* The manager tracks every active talker on every watched talkgroup; the
      * PTT busy-guard reads that, so nothing extra needs recording here. */
     tgm_on_talker_start(&a->tgm, tg, call);
@@ -189,7 +221,9 @@ static int audio_start(svx_app *a) {
         return -1;
     }
 
-    a->audio_ready = 1;
+    a->audio_ready  = 1;
+    a->play_stalled = 0;
+    svx_wd_start(&a->play_wd, now_ms(), svx_dev_frames(a->play_dev));
     log_info("audio out: %s (%s, %d Hz, %d ms jitter buffer)",
              svx_dev_name(a->play_dev), svx_audio_backend_name(),
              SVX_RATE, a->cfg->jitter_ms);
@@ -203,6 +237,83 @@ static void audio_stop(svx_app *a) {
     svx_ring_free(&a->play_ring);
     codec_close(a->codec);       a->codec = NULL;
     svx_audio_term();
+}
+
+/* Close the output device and open it again, keeping the codec, the ring and
+ * the jitter buffer — what a restart would do for this one device. What was
+ * buffered is dropped: it is stale by now. On failure play_dev stays NULL and
+ * the next retry tries again; the jitter buffer copes with no device. */
+static int play_reopen(svx_app *a) {
+    jitter_set_device(&a->jb, NULL);
+    svx_dev_close(a->play_dev);          /* joins its thread: the ring has no consumer now */
+    a->play_dev = NULL;
+    jitter_flush(&a->jb);                /* with no device this resets the ring directly */
+
+    svx_devinfo out;
+    svx_audio_resolve(0, a->cfg->output_device, &out);
+    svx_dev *d = svx_dev_open_playback(out.id, &a->play_ring, &a->spk_peak);
+    if (!d) return -1;
+    if (svx_dev_start(d) != 0) { svx_dev_close(d); return -1; }
+
+    a->play_dev = d;
+    jitter_set_device(&a->jb, d);
+    svx_wd_restarted(&a->play_wd, now_ms(), svx_dev_frames(d));
+    return 0;
+}
+
+/* The output device runs for the life of the program, so its callback must
+ * keep being called. If it is not, received audio piles up unheard — the ring
+ * once sat full at 512 ms for 31 hours with nothing reported. */
+static void play_watch(svx_app *a) {
+    uint64_t now = now_ms();
+
+    if (a->play_stalled) {
+        if (a->play_dev && svx_dev_frames(a->play_dev) != a->play_wd.last_count) {
+            a->play_stalled = 0;
+            svx_wd_start(&a->play_wd, now, svx_dev_frames(a->play_dev));
+            log_info("the output device is playing again");
+            if (strcmp(a->banner, PLAY_STALLED_BANNER) == 0) app_dismiss_banner(a);
+        } else if (now >= a->play_retry_ms) {
+            a->play_retry_ms = now + PLAY_RETRY_MS;
+            log_dbg("retrying the stalled output device");
+            play_reopen(a);
+        }
+        return;
+    }
+
+    svx_wd_verdict v   = SVX_WD_OK;
+    const char    *why = NULL;
+    switch (svx_dev_poll_event(a->play_dev)) {
+    case SVX_DEV_STOPPED:
+    case SVX_DEV_LOST:
+        v   = svx_wd_trip(&a->play_wd);
+        why = "was stopped by the system";
+        break;
+    case SVX_DEV_REROUTED:
+        /* The system moved the stream; it is still running, and if the move
+         * broke it the counter below will say so. */
+        log_info("the output device was rerouted by the system");
+        break;
+    default:
+        break;
+    }
+    if (v == SVX_WD_OK) {
+        v   = svx_wd_check(&a->play_wd, now, svx_dev_frames(a->play_dev));
+        why = "stopped playing";
+    }
+
+    if (v == SVX_WD_REOPEN) {
+        log_warn("the output device %s — reopening it", why);
+        if (play_reopen(a) == 0) return;
+        v = SVX_WD_GIVE_UP;
+    }
+    if (v == SVX_WD_GIVE_UP) {
+        log_err("the output device %s and reopening it did not help — "
+                "received audio is not heard; retrying every %d s", why, PLAY_RETRY_MS / 1000);
+        banner_set(a, PLAY_STALLED_BANNER);
+        a->play_stalled  = 1;
+        a->play_retry_ms = now + PLAY_RETRY_MS;
+    }
 }
 
 
@@ -242,6 +353,71 @@ static void tx_beep(svx_app *a, int count) {
         int16_t gap[SVX_RATE / 16];          /* 62 ms of silence between beeps */
         memset(gap, 0, sizeof(gap));
         if (b + 1 < count) svx_ring_write(&a->play_ring, gap, SVX_RATE / 16);
+    }
+}
+
+/* Open the configured input device onto cap_ring. Not started. */
+static int cap_dev_open(svx_app *a) {
+    svx_devinfo in;
+    svx_audio_resolve(1, a->cfg->input_device, &in);
+    a->cap_dev = svx_dev_open_capture(in.id, &a->cap_ring, &a->mic_peak);
+    return a->cap_dev ? 0 : -1;
+}
+
+/* Close the input device and open it again in the middle of an over: what
+ * tx_close() + tx_open() do, or a restart, which were the only cures for a
+ * capture stream that started and then never delivered. The codec, the ring
+ * and the over's counters carry on. */
+static int cap_reopen(svx_app *a, const char *why) {
+    log_warn("the microphone %s — reopening the input device", why);
+
+    if (svx_dev_saw_nonsilence(a->cap_dev)) a->tx_saw_sound = 1;
+    svx_dev_close(a->cap_dev);           /* joins its thread: nothing writes cap_ring now */
+    a->cap_dev = NULL;
+    if (cap_dev_open(a) != 0) return -1;
+    svx_dev_reset_silence(a->cap_dev);
+    if (svx_dev_start(a->cap_dev) != 0) return -1;
+
+    svx_wd_restarted(&a->cap_wd, now_ms(), svx_dev_frames(a->cap_dev));
+    return 0;
+}
+
+/* Called while transmitting: is the microphone still delivering? */
+static void cap_watch(svx_app *a) {
+    svx_wd_verdict v   = SVX_WD_OK;
+    const char    *why = NULL;
+
+    switch (svx_dev_poll_event(a->cap_dev)) {
+    case SVX_DEV_STOPPED:
+    case SVX_DEV_LOST:
+        v   = svx_wd_trip(&a->cap_wd);
+        why = "was stopped by the system";
+        break;
+    case SVX_DEV_REROUTED:
+        log_info("the input device was rerouted by the system");
+        break;
+    default:
+        break;
+    }
+    if (v == SVX_WD_OK) {
+        v   = svx_wd_check(&a->cap_wd, now_ms(), svx_dev_frames(a->cap_dev));
+        why = a->cap_wd.flowing ? "stopped delivering audio" : "delivered no audio";
+    }
+
+    if (v == SVX_WD_REOPEN) {
+        if (cap_reopen(a, why) == 0) return;
+        v = SVX_WD_GIVE_UP;
+    }
+    if (v == SVX_WD_GIVE_UP) {
+        /* Stop rather than stay keyed sending nothing: the reflector gives
+         * the floor to whoever speaks next, and the operator believes they
+         * are on the air. */
+        log_err("the microphone %s and reopening the input device did not help", why);
+        tx_stop(a, "the microphone delivers no audio");
+        banner_set(a, "MIC STALLED - the input device stopped delivering audio and "
+                      "reopening it did not help; nothing was sent. Check the device "
+                      "(--list-devices) or restart. 'x' dismisses.");
+        tx_beep(a, 3);
     }
 }
 
@@ -288,11 +464,21 @@ static int tx_start(svx_app *a) {
     }
     if (a->tx_active) return 0;
 
+    /* A mid-over reopen that failed leaves no device; try once more now. */
+    if (!a->cap_dev && cap_dev_open(a) != 0) {
+        log_err("cannot open the microphone");
+        tx_beep(a, 3);
+        return -1;
+    }
+
     /* Start from a clean codec: gain and filter state from the last over must
      * not colour the first syllable of this one. */
     codec_reset(a->tx_codec);
     svx_ring_reset(&a->cap_ring);
     svx_dev_reset_silence(a->cap_dev);
+    /* Whatever the device reported while it was idle belongs to the last
+     * over; this one is judged by the watchdog from here. */
+    (void)svx_dev_poll_event(a->cap_dev);
 
     if (svx_dev_start(a->cap_dev) != 0) {
         log_err("cannot start the microphone");
@@ -300,9 +486,12 @@ static int tx_start(svx_app *a) {
         return -1;
     }
 
-    a->tx_active     = 1;
-    a->tx_started_ms = now_ms();
-    a->tx_frames     = 0;
+    a->tx_active       = 1;
+    a->tx_started_ms   = now_ms();
+    a->tx_frames       = 0;
+    a->tx_encode_fails = 0;
+    a->tx_saw_sound    = 0;
+    svx_wd_start(&a->cap_wd, a->tx_started_ms, svx_dev_frames(a->cap_dev));
     log_info("TX ON   TG %u", tgm_selected(&a->tgm));
     return 0;
 }
@@ -317,15 +506,38 @@ static void tx_stop(svx_app *a, const char *why) {
      * an audio timeout and logs a complaint about the node. */
     rc_send_flush(a->rc);
 
-    uint64_t secs = (now_ms() - a->tx_started_ms) / 1000;
-    log_info("TX OFF  %llu s, %llu frames%s%s",
-             (unsigned long long)secs, (unsigned long long)a->tx_frames,
-             why ? " — " : "", why ? why : "");
+    uint64_t ms   = now_ms() - a->tx_started_ms;
+    uint64_t secs = ms / 1000;
+
+    /* An over that sent nothing is a warning, never just a number in an info
+     * line: four such overs in a row once went by without one, while the
+     * microphone had silently stopped delivering. */
+    int no_audio = a->tx_frames == 0 && ms >= TX_NO_AUDIO_MS;
+    if (no_audio)
+        log_warn("TX OFF  %llu s, %llu frames%s%s",
+                 (unsigned long long)secs, (unsigned long long)a->tx_frames,
+                 why ? " — " : "", why ? why : "");
+    else
+        log_info("TX OFF  %llu s, %llu frames%s%s",
+                 (unsigned long long)secs, (unsigned long long)a->tx_frames,
+                 why ? " — " : "", why ? why : "");
+    if (no_audio) {
+        log_warn("keyed for %llu ms but the microphone delivered no audio — nothing was sent",
+                 (unsigned long long)ms);
+        if (ms >= 1000)
+            banner_set(a, "MIC STALLED - that over sent no audio: the input device "
+                          "delivered nothing. Check the device (--list-devices). 'x' dismisses.");
+    } else if (ms >= 1000 && a->tx_frames * 2 < ms / 20) {
+        log_warn("only %llu of about %llu frames were sent",
+                 (unsigned long long)a->tx_frames, (unsigned long long)(ms / 20));
+    }
+    if (a->tx_encode_fails)
+        log_warn("%llu frames could not be encoded", (unsigned long long)a->tx_encode_fails);
 
     /* The silent-microphone trap: on macOS a denied terminal yields a device
      * that opens fine and delivers perfect zeros. Say so, because otherwise
      * everything looks normal and nobody heard a word. */
-    if (a->tx_frames > 20 && !svx_dev_saw_nonsilence(a->cap_dev)) {
+    if (a->tx_frames > 20 && !a->tx_saw_sound && !svx_dev_saw_nonsilence(a->cap_dev)) {
 #if defined(__APPLE__)
         banner_set(a, "MIC BLOCKED - macOS gave us only silence. Grant your terminal "
                       "Microphone access (Privacy & Security), then restart. 'x' dismisses.");
@@ -362,7 +574,12 @@ static void tx_pump(svx_app *a) {
 
         uint8_t opus[SVX_MAX_OPUS];
         int n = codec_encode(a->tx_codec, a->tx_pcm, SVX_FRAME, opus, sizeof(opus));
-        if (n <= 0) { log_dbg("Opus encode failed (%d)", n); continue; }
+        if (n <= 0) {
+            /* Visible at the default level (once per over; tx_stop gives the
+             * count), or it cannot be told apart from a stalled microphone. */
+            if (a->tx_encode_fails++ == 0) log_warn("Opus encode failed (%d)", n);
+            continue;
+        }
 
         if (rc_send_audio(a->rc, opus, (size_t)n) != 0) {
             tx_stop(a, "the connection dropped");
@@ -370,6 +587,9 @@ static void tx_pump(svx_app *a) {
         }
         a->tx_frames++;
     }
+
+    cap_watch(a);
+    if (!a->tx_active) return;
 
     if (a->cfg->tx_timeout_sec > 0 &&
         now_ms() - a->tx_started_ms >= (uint64_t)a->cfg->tx_timeout_sec * 1000) {
@@ -408,10 +628,7 @@ static int tx_open(svx_app *a) {
         return -1;
     }
 
-    svx_devinfo in;
-    svx_audio_resolve(1, a->cfg->input_device, &in);
-    a->cap_dev = svx_dev_open_capture(in.id, &a->cap_ring, &a->mic_peak);
-    if (!a->cap_dev) {
+    if (cap_dev_open(a) != 0) {
         svx_ring_free(&a->cap_ring);
         codec_close(a->tx_codec); a->tx_codec = NULL;
         return -1;
@@ -598,6 +815,8 @@ svx_app *app_new(const svx_config *cfg, int no_tx) {
     a->out_muted = 0;
     a->volume_before_mute = cfg->output_volume_pct;
     snprintf(a->owner_kind, sizeof(a->owner_kind), "cli");
+    svx_wd_init(&a->cap_wd,  CAP_GRACE_MS,  CAP_STALL_MS,  1);
+    svx_wd_init(&a->play_wd, PLAY_GRACE_MS, PLAY_STALL_MS, 1);
 
     rc_callbacks cb = {
         .user            = a,
@@ -685,12 +904,18 @@ void app_service(svx_app *a, uint64_t now) {
     ctl_drain(&a->ctl);
 
     rc_service(a->rc, now);
-    if (a->audio_ready) jitter_tick(&a->jb, now);
+    if (a->audio_ready) {
+        jitter_tick(&a->jb, now);
+        play_watch(a);
+    }
     /* Re-sample the clock: rc_service() and the callbacks it fires (talker
      * events, connect) stamp timestamps with a fresh now_ms(), which is LATER
      * than the `now` sampled at entry. Passing the stale `now` to tgm_tick made
      * `now - last_traffic` underflow and the idle-drop fire the instant we
      * connected or a talker stopped. */
+    /* Our own over is traffic too: without this a long over whose echo never
+     * came back was cut by the idle drop's talkgroup change. */
+    if (a->tx_active) tgm_note_local_tx(&a->tgm, now_ms());
     tgm_tick(&a->tgm, now_ms());
     tx_pump(a);
 
