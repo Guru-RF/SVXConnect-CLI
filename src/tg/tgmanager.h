@@ -112,6 +112,10 @@ void tgm_after_connect(tg_manager *m);
 void tgm_on_talker_start(tg_manager *m, uint32_t tg, const char *call);
 void tgm_on_talker_stop (tg_manager *m, uint32_t tg, const char *call);
 
+/* We are transmitting: that counts as traffic for the idle drop, whether or not
+ * the reflector has echoed our talker start. */
+void tgm_note_local_tx(tg_manager *m, uint64_t now);
+
 /* Once a second or so: expires linger, drops to monitor-only when idle, and
  * prunes talkers the server never told us had stopped. */
 void tgm_tick(tg_manager *m, uint64_t now);

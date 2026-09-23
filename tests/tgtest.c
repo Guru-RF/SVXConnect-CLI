@@ -267,6 +267,25 @@ static void t_idle_drops_to_monitor_only(void) {
           "should have dropped to monitor-only, still on %u", tgm_selected(&m));
 }
 
+static void t_idle_counts_our_own_tx(void) {
+    printf("idle: our own transmission is traffic, echoed or not\n");
+    /* If the reflector never echoes our talker start (it did not, while the
+     * microphone was delivering nothing), a long over must still not be cut by
+     * the idle drop's talkgroup change. */
+    svx_config cfg; setup(&cfg, "8", "8");
+    cfg.idle_seconds = 1;
+    tg_manager m; tgm_init(&m, &cfg, &CB);
+    tgm_select(&m, 8);
+    m.linger_until = 0;
+
+    reset_spy();
+    m.last_traffic = now_ms() - 5000;          /* nothing from the reflector for 5 s */
+    tgm_note_local_tx(&m, now_ms());           /* but we are keyed */
+    tgm_tick(&m, now_ms());
+    CHECK(tgm_selected(&m) == 8,
+          "keyed up, the idle drop must not deselect, dropped to %u", tgm_selected(&m));
+}
+
 static void t_idle_no_underflow_on_stale_now(void) {
     printf("idle: a 'now' behind last_traffic must NOT trigger the idle drop\n");
     /* Regression: app_service samples `now`, then rc_service's callbacks stamp
@@ -330,6 +349,7 @@ int main(void) {
     t_tiebreak_is_deterministic();
     t_mute_removes_from_monitor();
     t_idle_drops_to_monitor_only();
+    t_idle_counts_our_own_tx();
     t_idle_no_underflow_on_stale_now();
     t_monitor_always_follows_select();
     t_arrows_wrap();

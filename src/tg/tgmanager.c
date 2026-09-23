@@ -311,6 +311,10 @@ void tgm_on_talker_stop(tg_manager *m, uint32_t tg, const char *call) {
     if (m->cb.changed) m->cb.changed(m->cb.user);
 }
 
+void tgm_note_local_tx(tg_manager *m, uint64_t now) {
+    if (now > m->last_traffic) m->last_traffic = now;
+}
+
 void tgm_tick(tg_manager *m, uint64_t now) {
     /* Timestamps here are set from now_ms(); guard every elapsed-time
      * subtraction against a `now` that is somehow behind one of them, so an
