@@ -4,6 +4,8 @@
 #ifndef SVX_ENROLL_H
 #define SVX_ENROLL_H
 
+#include <time.h>
+
 #include "common/config.h"
 
 /* Obtain a signed client certificate from the reflector.
@@ -19,5 +21,10 @@
  * Returns 0 once the certificate is stored, 1 if interrupted while still
  * waiting, and -1 on an unrecoverable error. */
 int enroll_run(const svx_config *cfg, int retry_seconds);
+
+/* 1 when the pki directory already holds a certificate that can log in: it
+ * matches our key and has not expired. An expired one is NOT usable — it
+ * needs a new request, made with the same key. */
+int enroll_have_usable_cert(const svx_config *cfg, time_t now);
 
 #endif

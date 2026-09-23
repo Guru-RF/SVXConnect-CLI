@@ -2,6 +2,7 @@
  * SVXConnect-CLI — Copyright (c) 2026 Joeri Van Dooren
  */
 #include "handshake.h"
+#include "cert.h"
 #include "nodeinfo.h"
 #include "frameio.h"
 
@@ -16,6 +17,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <errno.h>
+#include <time.h>
 #include <poll.h>
 #include <sys/socket.h>
 
@@ -54,19 +56,29 @@ int handshake_run(const svx_config *cfg, handshake_result *out,
         log_info("SRV %s -> %s:%u", cfg->reflector, out->host, out->port);
     }
 
-    /* ---- 2. certificate material must exist before we bother connecting ---- */
-    char ca_path[1024], key_path[1024], cert_path[1024];
+    /* ---- 2. certificate material must exist before we bother connecting ----
+     * An expired certificate is not presented at all: the reflector would
+     * refuse it in the TLS handshake. Connecting without one makes it ask for
+     * a CSR instead, which is how an expired certificate gets replaced. */
+    char ca_path[1024];
     snprintf(ca_path, sizeof(ca_path), "%s/ca-bundle.crt", cfg->pki_dir);
-    pki_build_path(key_path,  sizeof(key_path),  cfg->pki_dir, cfg->callsign, "key");
-    pki_build_path(cert_path, sizeof(cert_path), cfg->pki_dir, cfg->callsign, "crt");
 
-    if (!pki_file_exists(key_path) || !pki_file_exists(cert_path)) {
+    cert_state cs;
+    cert_assess(cfg, time(NULL), &cs, 1);
+
+    if (!pki_file_exists(cs.key_path) || cs.status == PKI_CERT_MISSING) {
         FAIL(out, "no certificate for %s in %s — run 'svxconnect --enroll'",
              cfg->callsign, cfg->pki_dir);
     }
-    if (pki_check_pair(cert_path, key_path) != 0) {
+    if (cs.status == PKI_CERT_INVALID) {
+        FAIL(out, "%s is not a readable certificate — move it aside and run "
+             "'svxconnect --enroll'", cs.cert_path);
+    }
+    if (pki_check_pair(cs.cert_path, cs.key_path) != 0) {
         FAIL(out, "the certificate and key in %s do not match", cfg->pki_dir);
     }
+    const int present_cert = (cs.status != PKI_CERT_EXPIRED);
+    int       sent_csr     = 0;
 
     /* ---- 3. TCP ---- */
     if (ABORTED(abort_flag)) FAIL(out, "cancelled");
@@ -121,7 +133,9 @@ int handshake_run(const svx_config *cfg, handshake_result *out,
         }
 
         case MSG_START_ENCRYPTION:
-            out->ssl_ctx = tls_make_ctx(ca_path, cert_path, key_path);
+            out->ssl_ctx = tls_make_ctx(ca_path,
+                                        present_cert ? cs.cert_path : NULL,
+                                        present_cert ? cs.key_path  : NULL);
             if (!out->ssl_ctx) FAIL(out, "cannot load the certificate for %s", cfg->callsign);
             if (tls_start_ex(&out->tls, out->ssl_ctx, out->tcp_fd, HS_STEP_MS, abort_flag) != 0) {
                 if (errno == ECANCELED) FAIL(out, "cancelled");
@@ -160,6 +174,15 @@ int handshake_run(const svx_config *cfg, handshake_result *out,
         ssize_t L = fio_tls_recv_frame(&out->tls, buf, HS_BUF, HS_STEP_MS, abort_flag);
         if (L < 0) {
             if (errno == ECANCELED) FAIL(out, "cancelled");
+            if (sent_csr) {
+                /* The reflector hangs up after taking a request it cannot sign
+                 * by itself. That is the normal answer until the sysop has
+                 * signed. */
+                char na[32];
+                pki_format_time(cs.info.not_after, na, sizeof(na));
+                FAIL(out, "certificate expired on %s; new one requested — waiting for "
+                     "the reflector sysop to sign it", na);
+            }
             if (tls_failed(&out->tls)) {
                 char why[200];
                 FAIL(out, "login failed (%s)", tls_close_describe(&out->tls, why, sizeof(why)));
@@ -253,6 +276,42 @@ int handshake_run(const svx_config *cfg, handshake_result *out,
 
             got_udp = 1;
             break;
+        }
+
+        case MSG_CLIENT_CSR_REQUEST: {
+            /* Asked for when we connected without a certificate. Always from
+             * the key we already have: the reflector treats a new key for a
+             * known callsign as a hijack attempt. */
+            if (pki_ensure_csr(cs.key_path, cs.csr_path, cfg->callsign, cfg->email) != 0)
+                FAIL(out, "cannot prepare a certificate request in %s", cfg->pki_dir);
+            size_t csr_len = 0;
+            char  *csr_pem = read_file(cs.csr_path, &csr_len);
+            if (!csr_pem) FAIL(out, "cannot read %s", cs.csr_path);
+            int built = proto_build_client_csr(buf, HS_BUF, &blen, csr_pem, csr_len);
+            free(csr_pem);
+            if (built != 0) FAIL(out, "internal: ClientCsr");
+            if (fio_tls_send(&out->tls, buf, blen) != 0) FAIL(out, "connection lost");
+            sent_csr = 1;
+            log_info("certificate request for %s sent to the reflector", cfg->callsign);
+            break;
+        }
+
+        case MSG_CLIENT_CERT: {
+            /* Either the answer to our request or a renewal pushed at login.
+             * Both ways the reflector ignores the rest of this session, so the
+             * login ends here and the next one uses whatever is on disk. */
+            pki_push_result r = cert_handle_push(cfg, buf, (size_t)L, time(NULL));
+            if (r == PKI_PUSH_STORED) {
+                out->cert_renewed = 1;
+                FAIL(out, "new certificate stored — reconnecting to use it");
+            }
+            if (r == PKI_PUSH_EMPTY && sent_csr) {
+                char na[32];
+                pki_format_time(cs.info.not_after, na, sizeof(na));
+                FAIL(out, "certificate expired on %s; new one requested — waiting "
+                     "for the reflector sysop to sign it", na);
+            }
+            FAIL(out, "the reflector sent an unusable certificate — see the log");
         }
 
         case MSG_ERROR: {

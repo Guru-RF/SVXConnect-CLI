@@ -211,6 +211,10 @@ APP_TEST_OBJ := $(BUILD)/tests/apptest.o \
                 $(BUILD)/tests/dev_fake.o \
                 $(BUILD)/tests/rc_stub.o \
                 $(BUILD)/src/app.o \
+                $(BUILD)/src/reflector/cert.o \
+                $(BUILD)/src/common/pki.o \
+                $(BUILD)/src/common/tls.o \
+                $(BUILD)/src/common/proto.o \
                 $(BUILD)/src/audio/watchdog.o \
                 $(BUILD)/src/audio/playout.o \
                 $(BUILD)/src/audio/jitter.o \
@@ -226,10 +230,35 @@ APP_TEST_OBJ := $(BUILD)/tests/apptest.o \
 
 $(BUILD)/apptest: $(APP_TEST_OBJ)
 	@mkdir -p $(@D)
-	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $^ -lresolv $(OPUS_LIBS) -lm $(PLATFORM_LIBS)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $^ -lssl -lcrypto -lresolv $(OPUS_LIBS) -lm $(PLATFORM_LIBS)
+
+# The certificate lifecycle: renewal pushed by the reflector, an expired
+# certificate replaced through a new request with the same key. These run the
+# real handshake, session and enrolment code against an in-process reflector,
+# because the failure they guard against only shows the day a certificate
+# expires.
+CERT_TEST_OBJ := $(BUILD)/tests/certtest.o \
+                 $(BUILD)/src/reflector/cert.o \
+                 $(BUILD)/src/reflector/client.o \
+                 $(BUILD)/src/reflector/enroll.o \
+                 $(BUILD)/src/reflector/frameio.o \
+                 $(BUILD)/src/reflector/handshake.o \
+                 $(BUILD)/src/reflector/nodeinfo.o \
+                 $(BUILD)/src/common/config.o \
+                 $(BUILD)/src/common/crypto.o \
+                 $(BUILD)/src/common/log.o \
+                 $(BUILD)/src/common/net.o \
+                 $(BUILD)/src/common/pki.o \
+                 $(BUILD)/src/common/proto.o \
+                 $(BUILD)/src/common/tls.o \
+                 $(BUILD)/src/common/util.o
+
+$(BUILD)/certtest: $(CERT_TEST_OBJ)
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $^ -lssl -lcrypto -lresolv -lpthread -lm
 
 test: $(BUILD)/tgtest $(BUILD)/cryptotest $(BUILD)/conftest $(BUILD)/localtest \
-      $(BUILD)/wdtest $(BUILD)/playouttest $(BUILD)/apptest
+      $(BUILD)/wdtest $(BUILD)/playouttest $(BUILD)/apptest $(BUILD)/certtest
 	@$(BUILD)/tgtest
 	@$(BUILD)/cryptotest
 	@$(BUILD)/conftest
@@ -237,6 +266,7 @@ test: $(BUILD)/tgtest $(BUILD)/cryptotest $(BUILD)/conftest $(BUILD)/localtest \
 	@$(BUILD)/wdtest
 	@$(BUILD)/playouttest
 	@$(BUILD)/apptest
+	@$(BUILD)/certtest
 
 # Connection tests: the real client and app core against a fake reflector on
 # loopback (tests/fakerefl.c) — freezes on disconnect/reconnect/PTT, the reason

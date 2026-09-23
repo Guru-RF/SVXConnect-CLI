@@ -2,6 +2,7 @@
  * SVXConnect-CLI — Copyright (c) 2026 Joeri Van Dooren
  */
 #include "client.h"
+#include "cert.h"
 #include "handshake.h"
 
 #include "common/log.h"
@@ -17,6 +18,7 @@
 #include <errno.h>
 #include <pthread.h>
 #include <stdatomic.h>
+#include <time.h>
 #include <sys/socket.h>
 
 #define RC_MAX_FRAME   (256 * 1024)
@@ -494,6 +496,22 @@ static void handle_frame(rc_client *c, const uint8_t *body, size_t len) {
         break;
     }
 
+    case MSG_CLIENT_CERT: {
+        /* The reflector renews a certificate past 2/3 of its lifetime by
+         * pushing it here, about ten minutes into a session — and ignores
+         * everything else on that session afterwards. So reconnect whatever
+         * the outcome: straight away with a new certificate, through the
+         * normal backoff otherwise. */
+        pki_push_result r = cert_handle_push(c->cfg, body, len, time(NULL));
+        if (r == PKI_PUSH_STORED) {
+            log_info("reconnecting to log in with the renewed certificate");
+            rc_reconnect_now(c);
+        } else {
+            enter_backoff(c, "the reflector sent a certificate we cannot use");
+        }
+        break;
+    }
+
     case MSG_AUTH_OK:
     case MSG_SERVER_INFO:
         break;                                 /* already handled at login */
@@ -752,6 +770,9 @@ void rc_service(rc_client *c, uint64_t now) {
             j->claimed = 1;
             adopt_connection(c, &j->result);
         } else {
+            /* A certificate stored during login ends that login on purpose;
+             * the retry should be the shortest one, not the next step up. */
+            if (j->result.cert_renewed) c->backoff_idx = 0;
             enter_backoff(c, j->result.err[0] ? j->result.err : "connection failed");
         }
         pthread_mutex_lock(&j->mu);

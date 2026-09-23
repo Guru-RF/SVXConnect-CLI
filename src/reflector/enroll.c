@@ -2,6 +2,7 @@
  * SVXConnect-CLI — Copyright (c) 2026 Joeri Van Dooren
  */
 #include "enroll.h"
+#include "cert.h"
 #include "frameio.h"
 
 #include "common/log.h"
@@ -18,6 +19,7 @@
 #include <stdatomic.h>
 #include <unistd.h>
 #include <errno.h>
+#include <time.h>
 
 #define EN_BUF       (256 * 1024)
 #define EN_CONNECT_MS 10000
@@ -116,11 +118,13 @@ static int attempt(const svx_config *cfg, int *out_sent_csr) {
         }
 
         case MSG_START_ENCRYPTION: {
-            /* Present our certificate if we already have one — a re-run after
+            /* Present our certificate if we have a usable one — a re-run after
              * the sysop has signed needs it to authenticate. On the very first
              * run there is nothing to present and the server does not expect
-             * one, which is exactly why it will ask for a CSR next. */
-            int have_cert = pki_file_exists(key_path) && pki_file_exists(cert_path);
+             * one, which is exactly why it will ask for a CSR next. An expired
+             * certificate is left out too: the reflector would refuse it in
+             * the TLS handshake instead of asking for a new request. */
+            int have_cert = (enroll_have_usable_cert(cfg, time(NULL)) == 1);
             ssl_ctx = tls_make_ctx(ca_path,
                                    have_cert ? cert_path : NULL,
                                    have_cert ? key_path  : NULL);
@@ -131,17 +135,11 @@ static int attempt(const svx_config *cfg, int *out_sent_csr) {
         }
 
         case MSG_CLIENT_CSR_REQUEST: {
-            if (!pki_file_exists(key_path) || !pki_file_exists(csr_path)) {
-                log_info("generating a key and certificate request for %s", cfg->callsign);
-                if (pki_generate_csr(key_path, csr_path, cfg->callsign, cfg->email) != 0) {
-                    rc = -1;
-                    goto done;
-                }
-            } else {
-                /* Never regenerate. The sysop may be looking at the earlier
-                 * request right now; replacing it would invalidate whatever
-                 * they are about to sign. */
-                log_dbg("reusing the existing request %s", csr_path);
+            /* Reuses the key and request already on disk, and never replaces
+             * an existing key — see pki_ensure_csr(). */
+            if (pki_ensure_csr(key_path, csr_path, cfg->callsign, cfg->email) != 0) {
+                rc = -1;
+                goto done;
             }
 
             size_t csr_len = 0;
@@ -158,26 +156,33 @@ static int attempt(const svx_config *cfg, int *out_sent_csr) {
             break;
         }
 
-        case MSG_CLIENT_CERT: {
-            char *pem = malloc(EN_BUF);
-            if (!pem) { rc = -1; goto done; }
-            if (proto_parse_pem_blob(buf, (size_t)L, pem, EN_BUF) != 0) {
-                free(pem);
-                log_err("the reflector sent a certificate that is not PEM");
+        case MSG_CLIENT_CERT:
+            /* Checked before it is written: a certificate for another
+             * callsign or key, or an expired one, would replace a file that
+             * may still work with one that certainly does not. */
+            switch (cert_handle_push(cfg, buf, (size_t)L, time(NULL))) {
+            case PKI_PUSH_STORED:
+                rc = 0;
+                break;
+            case PKI_PUSH_EMPTY:
+                rc = 1;                  /* not signed yet: try again later */
+                break;
+            case PKI_PUSH_SAME:
+                /* The reflector considers the certificate we have current.
+                 * If it is expired here, the clocks disagree, and asking
+                 * again will not change that. */
+                log_err("the reflector still considers the certificate in %s valid; "
+                        "check the date and time on this computer, or ask the sysop "
+                        "to remove and re-sign the certificate for %s",
+                        cert_path, cfg->callsign);
                 rc = -1;
-                goto done;
-            }
-            if (write_file_atomic(cert_path, pem, strlen(pem), 0644) != 0) {
-                free(pem);
-                log_err("cannot write %s", cert_path);
+                break;
+            case PKI_PUSH_REJECTED:
+            case PKI_PUSH_WRITE_FAILED:
                 rc = -1;
-                goto done;
+                break;
             }
-            free(pem);
-            log_info("certificate stored in %s", cert_path);
-            rc = 0;
             goto done;
-        }
 
         case MSG_AUTH_CHALLENGE:
             /* The server is trying to authenticate the session. Reaching this
@@ -199,7 +204,7 @@ static int attempt(const svx_config *cfg, int *out_sent_csr) {
         case MSG_AUTH_OK:
             /* We authenticated, so a valid signed certificate is already on
              * disk and being used. Nothing left to enrol. */
-            if (pki_file_exists(cert_path)) {
+            if (enroll_have_usable_cert(cfg, time(NULL)) == 1) {
                 log_info("%s already has a valid certificate in %s",
                          cfg->callsign, cfg->pki_dir);
                 rc = 0;
@@ -228,6 +233,21 @@ done:
     return rc;
 }
 
+int enroll_have_usable_cert(const svx_config *cfg, time_t now) {
+    cert_state cs;
+    cert_assess(cfg, now, &cs, 0);
+    switch (cs.status) {
+    case PKI_CERT_MISSING:
+    case PKI_CERT_INVALID:
+    case PKI_CERT_EXPIRED:
+        return 0;
+    default:
+        break;
+    }
+    if (!pki_file_exists(cs.key_path)) return 0;
+    return pki_check_pair(cs.cert_path, cs.key_path) == 0 ? 1 : 0;
+}
+
 int enroll_run(const svx_config *cfg, int retry_seconds) {
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
@@ -240,19 +260,28 @@ int enroll_run(const svx_config *cfg, int retry_seconds) {
         return -1;
     }
 
-    char cert_path[1024], key_path[1024];
-    pki_build_path(cert_path, sizeof(cert_path), cfg->pki_dir, cfg->callsign, "crt");
-    pki_build_path(key_path,  sizeof(key_path),  cfg->pki_dir, cfg->callsign, "key");
+    cert_state cs;
+    cert_assess(cfg, time(NULL), &cs, 0);
+    char na[32];
+    pki_format_time(cs.info.not_after, na, sizeof(na));
+    int days = pki_days_until(cs.info.not_after, time(NULL));
 
-    if (pki_file_exists(cert_path) && pki_file_exists(key_path) &&
-        pki_check_pair(cert_path, key_path) == 0) {
-        char cn[64] = "", exp[32] = "";
-        int  days = 0;
-        pki_cert_info(cert_path, cn, sizeof(cn), exp, sizeof(exp), &days);
+    if (enroll_have_usable_cert(cfg, time(NULL)) == 1) {
         log_info("%s already has a certificate, valid until %s (%d days)",
-                 cn[0] ? cn : cfg->callsign, exp, days);
-        log_info("delete %s to enrol again", cert_path);
+                 cfg->callsign, na, days);
+        if (cs.status == PKI_CERT_OK) {
+            log_info("the reflector renews it by itself from the day it is 2/3 "
+                     "through its lifetime; nothing to do");
+        } else if (cs.status == PKI_CERT_RENEW_DUE || cs.status == PKI_CERT_EXPIRING) {
+            log_info("renewal is due. The reflector sends the renewed certificate "
+                     "to svxconnect once it has been connected for ten minutes — "
+                     "run svxconnect and leave it connected.");
+        }
         return 0;
+    }
+    if (cs.status == PKI_CERT_EXPIRED) {
+        log_warn("the certificate for %s EXPIRED on %s — requesting a new one "
+                 "with the same key", cfg->callsign, na);
     }
 
     log_info("enrolling %s with %s", cfg->callsign, cfg->reflector);
@@ -269,7 +298,7 @@ int enroll_run(const svx_config *cfg, int retry_seconds) {
         if (rc == 0) {
             char cn[64] = "", exp[32] = "";
             int  days = 0;
-            pki_cert_info(cert_path, cn, sizeof(cn), exp, sizeof(exp), &days);
+            pki_cert_info(cs.cert_path, cn, sizeof(cn), exp, sizeof(exp), &days);
             log_info("enrolled. %s is valid until %s (%d days).",
                      cn[0] ? cn : cfg->callsign, exp, days);
             log_info("you can now run: svxconnect");
