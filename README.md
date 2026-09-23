@@ -12,9 +12,10 @@ terminal window.
 > **Status: working, and on the air.** The reflector client, certificate
 > enrolment, audio both ways, the talkgroup manager and the ncurses interface
 > are all done and verified against a live reflector — including a full
-> transmit/receive round-trip through a parrot talkgroup. `make test` runs 40
-> unit checks (talkgroup preemption and crypto/replay); the build is clean on
-> clang and gcc and passes AddressSanitizer, ThreadSanitizer and a leak check.
+> transmit/receive round-trip through a parrot talkgroup. `make check` runs 341
+> checks — the unit fixtures, plus the client, the audio core and certificate
+> renewal against a fake reflector on loopback — and passes clean under
+> AddressSanitizer, UndefinedBehaviorSanitizer and ThreadSanitizer.
 > There is also a `--headless` mode for unattended nodes. See [Roadmap](#roadmap).
 
 ```
@@ -214,8 +215,10 @@ See [docs/TCC.md](docs/TCC.md).
 
 All milestones complete and verified against the live `be.svx.link` reflector,
 including a transmit/receive round-trip through the parrot talkgroup. `make
-test` runs 58 checks (talkgroup preemption, crypto/replay, and the
-`--init-config` renderer).
+check` runs 341 checks: talkgroup preemption, crypto/replay, the
+`--init-config` renderer, the status file and control FIFO, the audio
+watchdog, certificate renewal, and the connection layer against a fake
+reflector.
 
 ## Licence
 
@@ -243,8 +246,10 @@ Full vocabulary in [docs/PTT.md](docs/PTT.md); service setup in
 
 ```sh
 make            # -> build/svxconnect
-make test       # unit fixtures: talkgroups, crypto, config, status file, control FIFO
-make check      # the above, plus the client against a fake reflector (~25 s)
+make test       # unit fixtures: talkgroups, crypto, config, status file, control FIFO,
+                #   audio watchdog and playout, the app core on a fake sound card,
+                #   certificate renewal against an in-process reflector
+make check      # the above, plus the client against a fake reflector (about a minute)
 make check-tsan # make check under ThreadSanitizer   (in build-tsan/)
 make check-asan # make check under ASan + UBSan      (in build-asan/)
 make asan       # AddressSanitizer + UndefinedBehaviorSanitizer build

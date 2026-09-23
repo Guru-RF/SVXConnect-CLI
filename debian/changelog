@@ -1,3 +1,28 @@
+svxconnect (0.1.3-1) unstable; urgency=medium
+
+  * A microphone or speaker whose stream starts but never runs is detected
+    and reopened, instead of transmitting silence (or playing nothing) until
+    the program is restarted. When a reopen does not help, TX stops and the
+    banner says so. A 0-frame transmission is never silent in the log again.
+  * The client certificate is renewed: a certificate the reflector pushes at
+    login or mid-session is validated and stored, an expired certificate or
+    one the reflector refuses is replaced through a request with the same
+    key, --enroll handles an expired certificate, and the banner warns
+    before the certificate expires.
+  * Disconnect, reconnect and PTT while connecting never block: the connect
+    worker is abortable and the TCP connect and TLS handshake have timeouts.
+  * The reason a connection dropped is kept (the reflector's MsgError, TLS
+    close, reset or local error), and a control channel or UDP audio path
+    that goes silent is noticed and re-established.
+  * The log sink is thread-safe, the control FIFO must be private to the
+    user, the status file is no longer fsync'd every second, UDP crypto can
+    never reuse a GCM nonce, and an app that was never started no longer
+    reads (or closes) stdin.
+  * Beeps play when they are made; another station given our talkgroup
+    while we are keyed un-keys us; miniaudio's own log is kept at debug.
+
+ -- Joeri Van Dooren <ure@on6ure.be>  Thu, 24 Sep 2026 01:10:14 +0200
+
 svxconnect (0.1.2-1) unstable; urgency=medium
 
   * Beeps honour the output volume and mute: the roger beep played at full
