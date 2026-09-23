@@ -101,12 +101,30 @@ void  svx_dev_set_gate(svx_dev *d, int open);
  * callback. */
 void  svx_dev_request_flush(svx_dev *d);
 void  svx_dev_request_drop (svx_dev *d, uint32_t samples);
+uint32_t svx_dev_drop_pending(svx_dev *d);   /* requested, not yet performed */
+
+/* Playback only: drop the NEWEST `samples` queued so far — a squelch tail. The
+ * main thread marks the span by its own write position and the callback skips
+ * it when it gets there, so what came before it still plays. */
+void  svx_dev_request_trim_newest(svx_dev *d, uint32_t samples);
 
 const char *svx_dev_name(svx_dev *d);
 uint32_t    svx_dev_underruns(svx_dev *d);   /* playback: starved callbacks */
 uint32_t    svx_dev_overruns (svx_dev *d);   /* capture: samples dropped    */
+uint64_t    svx_dev_dropped  (svx_dev *d);   /* playback: samples discarded by drop/trim */
 
-/* Drained by the main loop. The realtime thread only stores an enum. */
+/* Samples the callback has processed since the device was opened: delivered
+ * for capture, requested for playback (gate open or not). It only moves while
+ * the audio system is really calling us, so a count that stands still on a
+ * started device is the one sign of a stream that "started" and then never
+ * ran — which nothing else reports. */
+uint64_t    svx_dev_frames   (svx_dev *d);
+
+/* Drained by the main loop. The realtime thread only stores an enum.
+ *
+ * STOPPED means the device stopped while we wanted it running; our own
+ * svx_dev_stop() does not leave one behind, and a suspend the system undoes on
+ * its own clears itself. */
 svx_dev_event svx_dev_poll_event(svx_dev *d);
 
 /* Has the capture stream produced anything but bit-exact silence since the

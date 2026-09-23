@@ -101,3 +101,11 @@ void svx_ring_reset(svx_ring *r) {
     uint32_t h = atomic_load_explicit(&r->head, memory_order_acquire);
     atomic_store_explicit(&r->tail, h, memory_order_release);
 }
+
+uint32_t svx_ring_write_pos(const svx_ring *r) {
+    return atomic_load_explicit(&r->head, memory_order_relaxed);
+}
+
+uint32_t svx_ring_read_pos(const svx_ring *r) {
+    return atomic_load_explicit(&r->tail, memory_order_relaxed);
+}

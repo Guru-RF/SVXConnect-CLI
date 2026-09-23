@@ -38,6 +38,9 @@ void jitter_init(svx_jitter *j, svx_ring *ring, svx_codec *codec, int jitter_ms)
 }
 
 void jitter_set_device(svx_jitter *j, svx_dev *dev) {
+    /* The device counts what it discarded; keep that when it is replaced, so
+     * reopening the output does not reset the statistics. */
+    if (j->dev && j->dev != dev) j->n_dropped += svx_dev_dropped(j->dev);
     j->dev = dev;
     gate(j, j->state == JB_PLAYING);
 }
@@ -121,13 +124,19 @@ void jitter_tick(svx_jitter *j, uint64_t now) {
             }
         } else if (avail > j->max_samples) {
             /* Clock drift or a late join. Ask the CONSUMER to drop 20 ms of the
-             * oldest audio; we must not advance the tail from this thread. The
-             * request accumulates and svx_ring_discard caps to what is actually
-             * buffered, so a tick outrunning a callback can never over-drop. */
-            svx_dev_request_drop(j->dev, SVX_FRAME);
-            j->n_dropped += SVX_FRAME;
-            log_dbg("jitter: %u ms buffered, dropping 20 ms to catch up",
-                    avail * 1000 / SVX_RATE);
+             * oldest audio; we must not advance the tail from this thread.
+             *
+             * Only one request at a time. This ticks far more often than the
+             * callback runs, and if the callback has stopped altogether the
+             * requests used to pile up by the thousand — the drop counter
+             * climbed ~16k a second for a day with nothing being dropped, and a
+             * callback that came back would have discarded the whole buffer.
+             * The device counts what it really drops (svx_dev_dropped). */
+            if (svx_dev_drop_pending(j->dev) == 0) {
+                svx_dev_request_drop(j->dev, SVX_FRAME);
+                log_dbg("jitter: %u ms buffered, dropping 20 ms to catch up",
+                        avail * 1000 / SVX_RATE);
+            }
         }
         break;
     }
@@ -162,15 +171,20 @@ void jitter_trim_tail(svx_jitter *j, int ms) {
     uint32_t avail = svx_ring_avail(j->ring);
     if (want > avail) want = avail;
     if (want == 0) return;
-    /* Dropping the tail is the consumer's job — request it rather than racing
-     * the callback. */
-    if (j->dev) svx_dev_request_drop(j->dev, want);
-    else        svx_ring_discard(j->ring, want);
-    j->n_dropped += want;
+    /* The squelch tail is the NEWEST audio. Discarding from the read end (as
+     * this once did) cut speech out of the middle of the buffer and still
+     * played the tail. The consumer does the dropping, at the span we mark
+     * here by write position. With no device nothing is playing, so there is
+     * nothing to trim. */
+    svx_dev_request_trim_newest(j->dev, want);
 }
 
 void jitter_set_volume(svx_jitter *j, int pct) {
     j->volume_pct = CLAMP(pct, 0, 200);
+}
+
+uint64_t jitter_dropped(const svx_jitter *j) {
+    return j->n_dropped + (j->dev ? svx_dev_dropped(j->dev) : 0);
 }
 
 uint32_t jitter_depth_ms(const svx_jitter *j) {

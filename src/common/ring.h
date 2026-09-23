@@ -58,4 +58,9 @@ uint32_t svx_ring_discard(svx_ring *r, uint32_t n);
 /* Drop everything. Consumer side only. */
 void svx_ring_reset(svx_ring *r);
 
+/* The free-running positions, for marking a span of the stream: the producer
+ * may read its own write position, the consumer its own read position. */
+uint32_t svx_ring_write_pos(const svx_ring *r);   /* producer side only */
+uint32_t svx_ring_read_pos (const svx_ring *r);   /* consumer side only */
+
 #endif

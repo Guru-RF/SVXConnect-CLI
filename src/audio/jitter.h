@@ -53,7 +53,8 @@ typedef struct {
     uint64_t   n_frames;      /* decoded and queued          */
     uint64_t   n_concealed;   /* synthesised to cover loss   */
     uint64_t   n_underruns;   /* fell back to PREFILL        */
-    uint64_t   n_dropped;     /* discarded to catch up       */
+    uint64_t   n_dropped;     /* discarded: ring full, or by a replaced device;
+                               * jitter_dropped() adds the current device's */
     uint64_t   last_audio_ms;
 } svx_jitter;
 
@@ -88,6 +89,9 @@ void jitter_flush(svx_jitter *j);
 void jitter_trim_tail(svx_jitter *j, int ms);
 
 void jitter_set_volume(svx_jitter *j, int pct);
+
+/* Samples discarded so far, for the statistics. */
+uint64_t jitter_dropped(const svx_jitter *j);
 
 /* Milliseconds currently buffered. */
 uint32_t jitter_depth_ms(const svx_jitter *j);

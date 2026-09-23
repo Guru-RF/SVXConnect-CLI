@@ -719,7 +719,7 @@ void app_service(svx_app *a, uint64_t now) {
                      (unsigned long long)a->jb.n_frames,
                      (unsigned long long)a->jb.n_concealed,
                      (unsigned long long)a->jb.n_underruns,
-                     (unsigned long long)a->jb.n_dropped,
+                     (unsigned long long)jitter_dropped(&a->jb),
                      jitter_depth_ms(&a->jb));
         }
     }

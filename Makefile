@@ -171,7 +171,8 @@ $(BUILD)/cryptotest: $(CRYPTO_TEST_OBJ)
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $^ -lssl -lcrypto -lm
 
-# The audio device watchdog's decision is pure logic too.
+# The audio fixtures: the watchdog's decision is pure logic, and the playback
+# consumer and the jitter buffer run on a fake device (tests/dev_fake.c).
 WD_TEST_OBJ := $(BUILD)/tests/wdtest.o \
                $(BUILD)/src/audio/watchdog.o
 
@@ -179,12 +180,27 @@ $(BUILD)/wdtest: $(WD_TEST_OBJ)
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $^
 
+PLAYOUT_TEST_OBJ := $(BUILD)/tests/playouttest.o \
+                    $(BUILD)/tests/dev_fake.o \
+                    $(BUILD)/src/audio/playout.o \
+                    $(BUILD)/src/audio/jitter.o \
+                    $(BUILD)/src/audio/codec.o \
+                    $(BUILD)/src/common/ring.o \
+                    $(BUILD)/src/common/log.o \
+                    $(BUILD)/src/common/util.o
+
+$(BUILD)/playouttest: $(PLAYOUT_TEST_OBJ)
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $^ $(OPUS_LIBS) -lm
+
 test: $(BUILD)/tgtest $(BUILD)/cryptotest $(BUILD)/conftest \
-      $(BUILD)/wdtest
+      $(BUILD)/wdtest \
+      $(BUILD)/playouttest
 	@$(BUILD)/tgtest
 	@$(BUILD)/cryptotest
 	@$(BUILD)/conftest
 	@$(BUILD)/wdtest
+	@$(BUILD)/playouttest
 
 asan:
 	$(MAKE) clean
