@@ -139,7 +139,7 @@ $(GEN)/example_conf.inc: example.conf
 $(BUILD)/src/main.o $(BUILD)/tests/conftest.o: $(GEN)/example_conf.inc
 $(BUILD)/src/main.o $(BUILD)/tests/conftest.o: CPPFLAGS += -I$(GEN)
 
-# Unit tests. Only the pure-logic modules are covered: the talkgroup
+# Unit tests. The pure-logic modules: the talkgroup
 # preemption rules, which have no I/O and are where a subtle mistake is both
 # most likely and least visible; and the --init-config renderer, which writes
 # into a file the user owns.
@@ -171,10 +171,20 @@ $(BUILD)/cryptotest: $(CRYPTO_TEST_OBJ)
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $^ -lssl -lcrypto -lm
 
-test: $(BUILD)/tgtest $(BUILD)/cryptotest $(BUILD)/conftest
+# The audio device watchdog's decision is pure logic too.
+WD_TEST_OBJ := $(BUILD)/tests/wdtest.o \
+               $(BUILD)/src/audio/watchdog.o
+
+$(BUILD)/wdtest: $(WD_TEST_OBJ)
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $^
+
+test: $(BUILD)/tgtest $(BUILD)/cryptotest $(BUILD)/conftest \
+      $(BUILD)/wdtest
 	@$(BUILD)/tgtest
 	@$(BUILD)/cryptotest
 	@$(BUILD)/conftest
+	@$(BUILD)/wdtest
 
 asan:
 	$(MAKE) clean
