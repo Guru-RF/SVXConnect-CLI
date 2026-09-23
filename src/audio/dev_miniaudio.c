@@ -64,10 +64,13 @@ static int        g_ma_log_ready;
 /* miniaudio's own log, into ours at debug level. A stream that stalls or a
  * backend that gives up leaves its reason here — and nowhere else: the device
  * callbacks just stop. miniaudio posts from its worker threads, which the log
- * sink allows (log.h). Its lines end in a newline; ours must not. */
+ * sink allows (log.h). Its lines end in a newline; ours must not. One line
+ * per libpulse/ALSA symbol it loads at start-up is left out: fifty lines that
+ * say nothing ("Failed to load symbol" still comes through). */
 static void on_ma_log(void *user, ma_uint32 level, const char *msg) {
     (void)user;
     if (log_get_level() < LOG_DBG || !msg) return;
+    if (strncmp(msg, "Loading symbol: ", 16) == 0) return;
     size_t n = strlen(msg);
     while (n > 0 && (msg[n - 1] == '\n' || msg[n - 1] == '\r')) n--;
     if (n == 0) return;
