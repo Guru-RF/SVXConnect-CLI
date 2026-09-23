@@ -106,7 +106,7 @@ endif
 OBJ := $(patsubst %.c,$(BUILD)/%.o,$(CSRC)) $(patsubst %.m,$(BUILD)/%.o,$(MSRC))
 DEP := $(OBJ:.o=.d)
 
-.PHONY: all clean install uninstall asan test
+.PHONY: all clean install uninstall asan test check check-tsan check-asan
 all: $(BUILD)/$(BIN)
 
 $(BUILD)/$(BIN): $(OBJ)
@@ -188,6 +188,32 @@ test: $(BUILD)/tgtest $(BUILD)/cryptotest $(BUILD)/conftest $(BUILD)/localtest
 	@$(BUILD)/conftest
 	@$(BUILD)/localtest
 
+# Connection tests: the real client and app core against a fake reflector on
+# loopback (tests/fakerefl.c) — freezes on disconnect/reconnect/PTT, the reason
+# a connection dropped, the receive watchdog, and when sockets are closed.
+# They take about 25 s (one waits out the 15 s TLS handshake timeout).
+CORE_OBJ := $(filter-out $(BUILD)/src/main.o $(BUILD)/src/ui/ui.o,$(OBJ))
+CONNECT_TEST_OBJ := $(BUILD)/tests/connecttest.o $(BUILD)/tests/fakerefl.o $(CORE_OBJ)
+
+$(BUILD)/connecttest: $(CONNECT_TEST_OBJ)
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $^ $(LDLIBS)
+
+check: test $(BUILD)/connecttest
+	@$(BUILD)/connecttest
+
+# The same suite under the sanitizers, each in its own build directory. The
+# connect worker is the one place with real concurrency, so TSan matters here.
+SAN_CFLAGS := -O1 -g -Wall -Wextra -Wno-unused-parameter -std=gnu11 -fno-omit-frame-pointer
+
+check-tsan:
+	TSAN_OPTIONS="halt_on_error=1 second_deadlock_stack=1" \
+	    $(MAKE) BUILD=build-tsan CFLAGS="$(SAN_CFLAGS) -fsanitize=thread" check
+
+check-asan:
+	ASAN_OPTIONS="detect_leaks=1" UBSAN_OPTIONS="halt_on_error=1 print_stacktrace=1" \
+	    $(MAKE) BUILD=build-asan CFLAGS="$(SAN_CFLAGS) -fsanitize=address,undefined -fno-sanitize-recover=undefined" check
+
 asan:
 	$(MAKE) clean
 	$(MAKE) CFLAGS="-O1 -g -Wall -Wextra -std=gnu11 -fsanitize=address,undefined -fno-omit-frame-pointer"
@@ -201,6 +227,6 @@ uninstall:
 	rm -f $(DESTDIR)$(BINDIR)/$(BIN)
 
 clean:
-	rm -rf $(BUILD)
+	rm -rf $(BUILD) build-tsan build-asan
 
 -include $(DEP)
