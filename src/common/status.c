@@ -39,7 +39,9 @@ int svx_status_write(const char *status_path, const svx_status *s) {
     if (n < 0) return -1;
     if (n > (int)sizeof(line)) n = (int)sizeof(line);   /* was truncated */
     mkparent(status_path);
-    return write_file_atomic(status_path, line, (size_t)n, 0644);
+    /* No fsync: this runs from the main loop once a second, and a slow disk
+     * must not hold up audio and heartbeats for an advisory file. */
+    return write_file_replace(status_path, line, (size_t)n, 0644);
 }
 
 void svx_status_clear(const char *status_path) {
