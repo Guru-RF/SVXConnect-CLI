@@ -207,7 +207,9 @@ int handshake_run(const svx_config *cfg, handshake_result *out,
                 crypto_set_rx(&out->crypto, iv4, k16);
                 log_dbg("UDP: server supplied its own receive key");
             } else if (rc == 1) {
-                crypto_use_tx_for_rx(&out->crypto);
+                if (crypto_use_tx_for_rx(&out->crypto) != 0)
+                    FAIL(out, "the reflector assigned client id 0 with a shared UDP key, "
+                              "which would reuse AES-GCM nonces — refusing");
                 log_dbg("UDP: server will use our key in both directions");
             } else {
                 FAIL(out, "malformed StartUdpEncryption");

@@ -19,6 +19,7 @@ void crypto_gen_tx_params(crypto_ctx_t *c, uint16_t client_id) {
     c->client_id    = client_id;
     c->tx_counter   = 0;
     c->sent_initial = 0;
+    c->tx_exhausted = 0;
 }
 
 void crypto_set_rx(crypto_ctx_t *c, const uint8_t iv_rand4[4], const uint8_t key[16]) {
@@ -33,13 +34,17 @@ void crypto_set_rx(crypto_ctx_t *c, const uint8_t iv_rand4[4], const uint8_t key
     c->rx_high       = 0;
 }
 
-void crypto_use_tx_for_rx(crypto_ctx_t *c) {
+int crypto_use_tx_for_rx(crypto_ctx_t *c) {
+    if (c->client_id == 0) return -1;
     memcpy(c->rx_iv_rand, c->tx_iv_rand, sizeof(c->rx_iv_rand));
     memcpy(c->rx_key,     c->tx_key,     sizeof(c->rx_key));
     c->rx_configured = 1;
     c->rx_have_high  = 0;
     c->rx_high       = 0;
+    return 0;
 }
+
+int crypto_tx_exhausted(const crypto_ctx_t *c) { return c->tx_exhausted; }
 
 /* ------------------------------------------------------------ GCM core */
 
@@ -98,6 +103,8 @@ end:
 ssize_t crypto_encrypt_wire(crypto_ctx_t *c,
                             const uint8_t *plaintext, size_t pt_len,
                             uint8_t *out, size_t out_cap) {
+    if (crypto_tx_exhausted(c)) return -1;
+
     int      initial = !c->sent_initial;
     uint32_t counter = initial ? 0 : c->tx_counter;
 
@@ -130,7 +137,10 @@ ssize_t crypto_encrypt_wire(crypto_ctx_t *c,
         return -1;
     memcpy(tag, tag16, 8);      /* the wire carries a truncated tag */
 
+    /* After 0xFFFFFFFF the counter would wrap to 0, a value already used
+     * under this key; stop there instead. */
     if (initial) { c->tx_counter = 1; c->sent_initial = 1; }
+    else if (c->tx_counter == UINT32_MAX) c->tx_exhausted = 1;
     else         { c->tx_counter += 1; }
 
     return (ssize_t)((size_t)aad_len + 8 + (size_t)ct_len);

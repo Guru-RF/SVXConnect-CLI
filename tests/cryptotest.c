@@ -8,6 +8,7 @@
 #include "common/crypto.h"
 
 #include <stdio.h>
+#include <stdint.h>
 #include <string.h>
 
 static int g_fail, g_run;
@@ -150,6 +151,37 @@ static void t_tamper_rejected(void) {
           "tampered ciphertext must fail the tag check");
 }
 
+/* The TX counter is 32 bits and the key lasts the whole connection, so
+ * wrapping it would reuse a nonce. Encryption must stop at the last value. */
+static void t_counter_exhaustion(void) {
+    printf("crypto: the TX counter refuses to wrap\n");
+    crypto_ctx_t a, b;
+    link_pair(&a, &b);
+    a.tx_counter = UINT32_MAX - 1;
+
+    uint8_t wire[256];
+    CHECK(send_one(&a, "x", wire, sizeof(wire)) > 0, "counter 0xFFFFFFFE should encrypt");
+    CHECK(send_one(&a, "x", wire, sizeof(wire)) > 0, "counter 0xFFFFFFFF should encrypt");
+    CHECK(crypto_tx_exhausted(&a), "should report exhaustion after the last value");
+    CHECK(send_one(&a, "x", wire, sizeof(wire)) < 0, "encrypted with a wrapped counter");
+
+    crypto_gen_tx_params(&a, 7);
+    CHECK(!crypto_tx_exhausted(&a), "a new key must reset exhaustion");
+}
+
+/* Shared-key mode with client id 0 would make our TX nonces and the server's
+ * identical under the same key. */
+static void t_shared_key_needs_client_id(void) {
+    printf("crypto: a shared UDP key is refused with client id 0\n");
+    crypto_ctx_t c;
+    crypto_init(&c);
+    crypto_gen_tx_params(&c, 0);
+    CHECK(crypto_use_tx_for_rx(&c) != 0, "accepted client id 0");
+    CHECK(!c.rx_configured, "configured RX anyway");
+    crypto_gen_tx_params(&c, 1681);
+    CHECK(crypto_use_tx_for_rx(&c) == 0, "refused a real client id");
+}
+
 int main(void) {
     printf("\ncrypto fixtures\n\n");
     t_roundtrip();
@@ -157,6 +189,8 @@ int main(void) {
     t_exact_replay_rejected();
     t_forged_counter_cannot_disable_replay();
     t_tamper_rejected();
+    t_counter_exhaustion();
+    t_shared_key_needs_client_id();
     printf("\n%d checks, %d failed\n\n", g_run, g_fail);
     return g_fail ? 1 : 0;
 }
