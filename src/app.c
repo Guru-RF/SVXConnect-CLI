@@ -253,10 +253,14 @@ static void tx_beep(svx_app *a, int count) {
 static int tx_start(svx_app *a) {
     /* The guard chain, in this order. Each refusal has its own beep so the
      * reason is audible without looking at the screen. */
-    if (rc_get_state(a->rc) != RC_CONNECTED) {
-        log_warn("PTT refused: not connected");
+    rc_state link = rc_get_state(a->rc);
+    if (link != RC_CONNECTED) {
+        log_warn("PTT refused: %s", link == RC_CONNECTING ? "still connecting" : "not connected");
         tx_beep(a, 3);
-        rc_reconnect_now(a->rc);
+        /* Nudge a stopped or backing-off link, but leave a connect in flight
+         * alone: restarting it threw the login away on every press, so a user
+         * who kept pressing could stop it from ever completing. */
+        if (link != RC_CONNECTING) rc_reconnect_now(a->rc);
         return -1;
     }
     if (tgm_selected(&a->tgm) == 0) {
@@ -717,9 +721,13 @@ void app_service(svx_app *a, uint64_t now) {
     tgm_tick(&a->tgm, now_ms());
     tx_pump(a);
 
-    /* If the link went away mid-over, stop rather than encode into a void. */
-    if (a->tx_active && rc_get_state(a->rc) != RC_CONNECTED)
-        tx_stop(a, "the connection dropped");
+    /* If the link went away mid-over, stop rather than encode into a void —
+     * and say why, not just that it happened. */
+    if (a->tx_active && rc_get_state(a->rc) != RC_CONNECTED) {
+        char why[300];
+        snprintf(why, sizeof(why), "the connection dropped: %s", rc_last_error(a->rc));
+        tx_stop(a, why);
+    }
 
     /* Publish state for the panel widget. Self-throttling; catches connection,
      * talkgroup and PTT changes that reach here via rc_service and tx_pump. */
@@ -757,13 +765,20 @@ void app_tg_select(svx_app *a, uint32_t tg)  { tgm_select(&a->tgm, tg); }
 void app_tg_index(svx_app *a, int idx)       { tgm_select_index(&a->tgm, idx); }
 void app_toggle_lock(svx_app *a)             { tgm_toggle_lock(&a->tgm); }
 void app_toggle_mute(svx_app *a, uint32_t t) { tgm_toggle_mute(&a->tgm, t); }
-void app_reconnect(svx_app *a)               { rc_reconnect_now(a->rc); }
+void app_reconnect(svx_app *a) {
+    /* Stop TX first, so the log says what happened (not "the connection
+     * dropped") and the flush reaches the reflector before the link goes. */
+    if (a->tx_active) tx_stop(a, "reconnecting");
+    rc_reconnect_now(a->rc);
+}
+
 void app_quit(svx_app *a)                    { a->quit = 1; }
 int  app_should_quit(const svx_app *a)       { return a->quit; }
 
 void app_toggle_connect(svx_app *a) {
-    if (rc_get_state(a->rc) == RC_IDLE) rc_start(a->rc);
-    else                                rc_stop(a->rc, "disconnected by you");
+    if (rc_get_state(a->rc) == RC_IDLE) { rc_start(a->rc); return; }
+    if (a->tx_active) tx_stop(a, "disconnected by you");
+    rc_stop(a->rc, "disconnected by you");
 }
 
 void app_volume_delta(svx_app *a, int delta) {
