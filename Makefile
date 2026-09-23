@@ -171,10 +171,36 @@ $(BUILD)/cryptotest: $(CRYPTO_TEST_OBJ)
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $^ -lssl -lcrypto -lm
 
-test: $(BUILD)/tgtest $(BUILD)/cryptotest $(BUILD)/conftest
+# The certificate lifecycle: renewal pushed by the reflector, an expired
+# certificate replaced through a new request with the same key. These run the
+# real handshake, session and enrolment code against an in-process reflector,
+# because the failure they guard against only shows the day a certificate
+# expires.
+CERT_TEST_OBJ := $(BUILD)/tests/certtest.o \
+                 $(BUILD)/src/reflector/cert.o \
+                 $(BUILD)/src/reflector/client.o \
+                 $(BUILD)/src/reflector/enroll.o \
+                 $(BUILD)/src/reflector/frameio.o \
+                 $(BUILD)/src/reflector/handshake.o \
+                 $(BUILD)/src/reflector/nodeinfo.o \
+                 $(BUILD)/src/common/config.o \
+                 $(BUILD)/src/common/crypto.o \
+                 $(BUILD)/src/common/log.o \
+                 $(BUILD)/src/common/net.o \
+                 $(BUILD)/src/common/pki.o \
+                 $(BUILD)/src/common/proto.o \
+                 $(BUILD)/src/common/tls.o \
+                 $(BUILD)/src/common/util.o
+
+$(BUILD)/certtest: $(CERT_TEST_OBJ)
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $^ -lssl -lcrypto -lresolv -lpthread -lm
+
+test: $(BUILD)/tgtest $(BUILD)/cryptotest $(BUILD)/conftest $(BUILD)/certtest
 	@$(BUILD)/tgtest
 	@$(BUILD)/cryptotest
 	@$(BUILD)/conftest
+	@$(BUILD)/certtest
 
 asan:
 	$(MAKE) clean
