@@ -139,7 +139,7 @@ $(GEN)/example_conf.inc: example.conf
 $(BUILD)/src/main.o $(BUILD)/tests/conftest.o: $(GEN)/example_conf.inc
 $(BUILD)/src/main.o $(BUILD)/tests/conftest.o: CPPFLAGS += -I$(GEN)
 
-# Unit tests. Only the pure-logic modules are covered: the talkgroup
+# Unit tests. The pure-logic modules: the talkgroup
 # preemption rules, which have no I/O and are where a subtle mistake is both
 # most likely and least visible; and the --init-config renderer, which writes
 # into a file the user owns.
@@ -182,11 +182,61 @@ $(BUILD)/localtest: $(LOCAL_TEST_OBJ)
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $^ -lm
 
-test: $(BUILD)/tgtest $(BUILD)/cryptotest $(BUILD)/conftest $(BUILD)/localtest
+# The audio fixtures: the watchdog's decision is pure logic; the playback
+# consumer and the jitter buffer run on a fake device (tests/dev_fake.c); and
+# apptest drives the real app.c against that fake and a stub reflector
+# (tests/rc_stub.c), so a device that starts and then never runs can be staged
+# without a sound card.
+WD_TEST_OBJ := $(BUILD)/tests/wdtest.o \
+               $(BUILD)/src/audio/watchdog.o
+
+$(BUILD)/wdtest: $(WD_TEST_OBJ)
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $^
+
+PLAYOUT_TEST_OBJ := $(BUILD)/tests/playouttest.o \
+                    $(BUILD)/tests/dev_fake.o \
+                    $(BUILD)/src/audio/playout.o \
+                    $(BUILD)/src/audio/jitter.o \
+                    $(BUILD)/src/audio/codec.o \
+                    $(BUILD)/src/common/ring.o \
+                    $(BUILD)/src/common/log.o \
+                    $(BUILD)/src/common/util.o
+
+$(BUILD)/playouttest: $(PLAYOUT_TEST_OBJ)
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $^ $(OPUS_LIBS) -lm
+
+APP_TEST_OBJ := $(BUILD)/tests/apptest.o \
+                $(BUILD)/tests/dev_fake.o \
+                $(BUILD)/tests/rc_stub.o \
+                $(BUILD)/src/app.o \
+                $(BUILD)/src/audio/watchdog.o \
+                $(BUILD)/src/audio/playout.o \
+                $(BUILD)/src/audio/jitter.o \
+                $(BUILD)/src/audio/codec.o \
+                $(BUILD)/src/tg/tgmanager.o \
+                $(BUILD)/src/ctl/ctlfifo.o \
+                $(BUILD)/src/common/status.o \
+                $(BUILD)/src/common/net.o \
+                $(BUILD)/src/common/config.o \
+                $(BUILD)/src/common/ring.o \
+                $(BUILD)/src/common/log.o \
+                $(BUILD)/src/common/util.o
+
+$(BUILD)/apptest: $(APP_TEST_OBJ)
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $^ -lresolv $(OPUS_LIBS) -lm $(PLATFORM_LIBS)
+
+test: $(BUILD)/tgtest $(BUILD)/cryptotest $(BUILD)/conftest $(BUILD)/localtest \
+      $(BUILD)/wdtest $(BUILD)/playouttest $(BUILD)/apptest
 	@$(BUILD)/tgtest
 	@$(BUILD)/cryptotest
 	@$(BUILD)/conftest
 	@$(BUILD)/localtest
+	@$(BUILD)/wdtest
+	@$(BUILD)/playouttest
+	@$(BUILD)/apptest
 
 # Connection tests: the real client and app core against a fake reflector on
 # loopback (tests/fakerefl.c) — freezes on disconnect/reconnect/PTT, the reason

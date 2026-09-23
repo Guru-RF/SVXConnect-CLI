@@ -53,7 +53,8 @@ typedef struct {
     uint64_t   n_frames;      /* decoded and queued          */
     uint64_t   n_concealed;   /* synthesised to cover loss   */
     uint64_t   n_underruns;   /* fell back to PREFILL        */
-    uint64_t   n_dropped;     /* discarded to catch up       */
+    uint64_t   n_dropped;     /* discarded: ring full, or by a replaced device;
+                               * jitter_dropped() adds the current device's */
     uint64_t   last_audio_ms;
 } svx_jitter;
 
@@ -79,6 +80,10 @@ void jitter_tick(svx_jitter *j, uint64_t now);
 /* A transmission ended: let what is buffered drain, but stop expecting more. */
 void jitter_end_of_stream(svx_jitter *j);
 
+/* Audio was queued straight into the ring (a beep, the test tone): make sure
+ * it plays now, even though no over is being received. */
+void jitter_kick(svx_jitter *j);
+
 /* Throw everything away — a talkgroup change, so what is queued belongs to
  * the talkgroup we just left. */
 void jitter_flush(svx_jitter *j);
@@ -88,6 +93,9 @@ void jitter_flush(svx_jitter *j);
 void jitter_trim_tail(svx_jitter *j, int ms);
 
 void jitter_set_volume(svx_jitter *j, int pct);
+
+/* Samples discarded so far, for the statistics. */
+uint64_t jitter_dropped(const svx_jitter *j);
 
 /* Milliseconds currently buffered. */
 uint32_t jitter_depth_ms(const svx_jitter *j);

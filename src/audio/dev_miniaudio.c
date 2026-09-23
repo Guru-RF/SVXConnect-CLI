@@ -28,6 +28,7 @@
 #include "miniaudio.h"
 
 #include "dev.h"
+#include "playout.h"
 #include "common/log.h"
 #include "common/util.h"
 
@@ -45,11 +46,10 @@ struct svx_dev {
     svx_ring        *ring;
     _Atomic float   *peak;
 
-    _Atomic uint32_t underruns;
+    svx_playout      po;             /* playback: gate, drop requests, counters */
     _Atomic uint32_t overruns;
-    _Atomic int      gate;           /* playback: 0 = emit silence, do not drain */
-    _Atomic int      flush_req;      /* playback: consumer drops everything      */
-    _Atomic uint32_t drop_req;       /* playback: consumer drops this many oldest */
+    _Atomic uint64_t cap_frames;     /* capture: samples delivered, ever */
+    _Atomic int      running;        /* we want it running: set by start, cleared by stop */
     _Atomic int      event;          /* svx_dev_event, set by the RT thread */
     _Atomic int      saw_nonsilence;
 
@@ -200,6 +200,7 @@ static void on_capture(ma_device *dev, void *out, const void *in, ma_uint32 n) {
 
     float pk = peak_abs_s16(s, n);
     atomic_store_explicit(d->peak, pk, memory_order_relaxed);
+    atomic_fetch_add_explicit(&d->cap_frames, n, memory_order_relaxed);
 
     /* A genuinely open microphone always has at least a bit of noise. Perfect
      * zeros mean macOS denied us and said nothing (see docs/TCC.md). */
@@ -210,38 +211,12 @@ static void on_capture(ma_device *dev, void *out, const void *in, ma_uint32 n) {
         atomic_fetch_add_explicit(&d->overruns, n - wrote, memory_order_relaxed);
 }
 
-/* REALTIME THREAD. */
+/* REALTIME THREAD. The ring logic lives in playout.c, where it is tested. */
 static void on_playback(ma_device *dev, void *out, const void *in, ma_uint32 n) {
     (void)in;
     svx_dev *d = (svx_dev *)dev->pUserData;
-    int16_t *o = (int16_t *)out;
-
-    /* Flush and catch-up drops are requested by the producer (the main thread)
-     * but PERFORMED here, because svx_ring's tail belongs to the consumer and
-     * this callback is that consumer. Doing them on the producer side would be
-     * two threads writing tail — a data race on a live audio path. Handled
-     * before the gate check so a flush requested while gated still takes
-     * effect. */
-    if (atomic_exchange_explicit(&d->flush_req, 0, memory_order_relaxed))
-        svx_ring_reset(d->ring);
-    uint32_t drop = atomic_exchange_explicit(&d->drop_req, 0, memory_order_relaxed);
-    if (drop) svx_ring_discard(d->ring, drop);
-
-    /* Gate closed: emit silence and leave the ring alone so it can fill.
-     * Draining here regardless is what keeps a jitter buffer permanently
-     * starved, because the device always takes exactly as much as arrives. */
-    if (!atomic_load_explicit(&d->gate, memory_order_relaxed)) {
-        memset(o, 0, (size_t)n * sizeof(int16_t));
-        atomic_store_explicit(d->peak, 0.0f, memory_order_relaxed);
-        return;
-    }
-
-    uint32_t got = svx_ring_read(d->ring, o, n);
-    if (got < n) {
-        memset(o + got, 0, (n - got) * sizeof(int16_t));
-        atomic_fetch_add_explicit(&d->underruns, 1, memory_order_relaxed);
-    }
-    atomic_store_explicit(d->peak, peak_abs_s16(o, n), memory_order_relaxed);
+    float pk = playout_consume(&d->po, d->ring, (int16_t *)out, n);
+    atomic_store_explicit(d->peak, pk, memory_order_relaxed);
 }
 
 /* REALTIME-ADJACENT: store an enum, nothing more. The main loop reacts. */
@@ -252,8 +227,21 @@ static void on_notify(const ma_device_notification *n) {
 
     switch (n->type) {
     case ma_device_notification_type_stopped:
-        atomic_store_explicit(&d->event, SVX_DEV_STOPPED, memory_order_relaxed);
+        /* miniaudio says "stopped" after every stop, our own included, and
+         * PulseAudio suspends a corked stream when its source goes idle. Only
+         * a stop while we want the device running is news; recording the rest
+         * would make every normal key-up look like a device failure. */
+        if (atomic_load_explicit(&d->running, memory_order_relaxed))
+            atomic_store_explicit(&d->event, SVX_DEV_STOPPED, memory_order_relaxed);
         break;
+    case ma_device_notification_type_started: {
+        /* A suspend that resumed on its own (PulseAudio posts "started" when
+         * the stream is unsuspended) is not a stop any more. */
+        int stopped = SVX_DEV_STOPPED;
+        atomic_compare_exchange_strong_explicit(&d->event, &stopped, SVX_DEV_OK,
+                                                memory_order_relaxed, memory_order_relaxed);
+        break;
+    }
     case ma_device_notification_type_rerouted:
         atomic_store_explicit(&d->event, SVX_DEV_REROUTED, memory_order_relaxed);
         break;
@@ -334,22 +322,34 @@ svx_dev *svx_dev_open_playback(const char *id, svx_ring *from_app, _Atomic float
 }
 
 void svx_dev_set_gate(svx_dev *d, int open) {
-    if (d) atomic_store_explicit(&d->gate, open ? 1 : 0, memory_order_relaxed);
+    if (d) atomic_store_explicit(&d->po.gate, open ? 1 : 0, memory_order_relaxed);
 }
 
 void svx_dev_request_flush(svx_dev *d) {
-    if (d) atomic_store_explicit(&d->flush_req, 1, memory_order_relaxed);
+    if (d) atomic_store_explicit(&d->po.flush_req, 1, memory_order_relaxed);
 }
 
 void svx_dev_request_drop(svx_dev *d, uint32_t samples) {
-    /* Accumulate: several trims between callbacks must all be honoured. */
-    if (d && samples) atomic_fetch_add_explicit(&d->drop_req, samples, memory_order_relaxed);
+    /* Accumulate: several drops between callbacks must all be honoured. */
+    if (d && samples) atomic_fetch_add_explicit(&d->po.drop_req, samples, memory_order_relaxed);
+}
+
+uint32_t svx_dev_drop_pending(svx_dev *d) {
+    return d ? atomic_load_explicit(&d->po.drop_req, memory_order_relaxed) : 0;
+}
+
+void svx_dev_request_trim_newest(svx_dev *d, uint32_t samples) {
+    if (d) playout_request_trim_newest(&d->po, d->ring, samples);
 }
 
 int svx_dev_start(svx_dev *d) {
     if (!d || !d->inited) return -1;
     if (d->started) return 0;
+    /* Before the start, so a stop the device reports the moment it has
+     * started is not mistaken for our own. */
+    atomic_store_explicit(&d->running, 1, memory_order_relaxed);
     if (ma_device_start(&d->ma) != MA_SUCCESS) {
+        atomic_store_explicit(&d->running, 0, memory_order_relaxed);
         log_err("cannot start the %s device", d->is_capture ? "input" : "output");
         return -1;
     }
@@ -359,6 +359,8 @@ int svx_dev_start(svx_dev *d) {
 
 int svx_dev_stop(svx_dev *d) {
     if (!d || !d->inited || !d->started) return 0;
+    /* Cleared first: miniaudio posts "stopped" from inside ma_device_stop(). */
+    atomic_store_explicit(&d->running, 0, memory_order_relaxed);
     ma_device_stop(&d->ma);
     d->started = 0;
     return 0;
@@ -375,7 +377,17 @@ void svx_dev_close(svx_dev *d) {
 const char *svx_dev_name(svx_dev *d) { return d && d->name[0] ? d->name : "(unknown)"; }
 
 uint32_t svx_dev_underruns(svx_dev *d) {
-    return d ? atomic_load_explicit(&d->underruns, memory_order_relaxed) : 0;
+    return d ? atomic_load_explicit(&d->po.underruns, memory_order_relaxed) : 0;
+}
+
+uint64_t svx_dev_frames(svx_dev *d) {
+    if (!d) return 0;
+    return d->is_capture ? atomic_load_explicit(&d->cap_frames, memory_order_relaxed)
+                         : atomic_load_explicit(&d->po.frames,  memory_order_relaxed);
+}
+
+uint64_t svx_dev_dropped(svx_dev *d) {
+    return d ? atomic_load_explicit(&d->po.dropped, memory_order_relaxed) : 0;
 }
 uint32_t svx_dev_overruns(svx_dev *d) {
     return d ? atomic_load_explicit(&d->overruns, memory_order_relaxed) : 0;
