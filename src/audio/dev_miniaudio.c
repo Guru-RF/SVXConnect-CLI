@@ -58,6 +58,21 @@ struct svx_dev {
 
 static ma_context g_ctx;
 static int        g_ctx_ready;
+static ma_log     g_ma_log;
+static int        g_ma_log_ready;
+
+/* miniaudio's own log, into ours at debug level. A stream that stalls or a
+ * backend that gives up leaves its reason here — and nowhere else: the device
+ * callbacks just stop. miniaudio posts from its worker threads, which the log
+ * sink allows (log.h). Its lines end in a newline; ours must not. */
+static void on_ma_log(void *user, ma_uint32 level, const char *msg) {
+    (void)user;
+    if (log_get_level() < LOG_DBG || !msg) return;
+    size_t n = strlen(msg);
+    while (n > 0 && (msg[n - 1] == '\n' || msg[n - 1] == '\r')) n--;
+    if (n == 0) return;
+    log_dbg("miniaudio %s: %.*s", ma_log_level_to_string(level), (int)n, msg);
+}
 
 const char *svx_audio_backend_name(void) {
     if (!g_ctx_ready) return "none";
@@ -80,8 +95,19 @@ int svx_audio_init(void) {
     cc.threadPriority         = ma_thread_priority_realtime;
     cc.pulse.pApplicationName = "SVXConnect";
 
+    /* Our own ma_log, handed to the context, so that backend selection in
+     * ma_context_init() is captured too — registering on the context's log
+     * afterwards would miss it. */
+    g_ma_log_ready = ma_log_init(NULL, &g_ma_log) == MA_SUCCESS;
+    if (g_ma_log_ready) {
+        ma_log_register_callback(&g_ma_log, ma_log_callback_init(on_ma_log, NULL));
+        cc.pLog = &g_ma_log;
+    }
+
     if (ma_context_init(be, (ma_uint32)(sizeof(be) / sizeof(be[0])), &cc, &g_ctx) != MA_SUCCESS) {
         log_err("cannot initialise the audio system");
+        if (g_ma_log_ready) ma_log_uninit(&g_ma_log);
+        g_ma_log_ready = 0;
         return -1;
     }
     g_ctx_ready = 1;
@@ -92,6 +118,8 @@ int svx_audio_init(void) {
 void svx_audio_term(void) {
     if (!g_ctx_ready) return;
     ma_context_uninit(&g_ctx);
+    if (g_ma_log_ready) ma_log_uninit(&g_ma_log);
+    g_ma_log_ready = 0;
     g_ctx_ready = 0;
 }
 

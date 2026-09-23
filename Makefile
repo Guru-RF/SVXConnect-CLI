@@ -232,6 +232,20 @@ $(BUILD)/apptest: $(APP_TEST_OBJ)
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $^ -lssl -lcrypto -lresolv $(OPUS_LIBS) -lm $(PLATFORM_LIBS)
 
+# miniaudio's own log forwarded into ours: the real audio context, no device.
+AUDIOLOG_TEST_OBJ := $(BUILD)/tests/audiologtest.o \
+                     $(BUILD)/src/audio/dev_miniaudio.o \
+                     $(BUILD)/src/audio/playout.o \
+                     $(BUILD)/src/audio/jitter.o \
+                     $(BUILD)/src/audio/codec.o \
+                     $(BUILD)/src/common/ring.o \
+                     $(BUILD)/src/common/log.o \
+                     $(BUILD)/src/common/util.o
+
+$(BUILD)/audiologtest: $(AUDIOLOG_TEST_OBJ)
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $^ $(OPUS_LIBS) -lm $(PLATFORM_LIBS)
+
 # The certificate lifecycle: renewal pushed by the reflector, an expired
 # certificate replaced through a new request with the same key. These run the
 # real handshake, session and enrolment code against an in-process reflector,
@@ -258,7 +272,8 @@ $(BUILD)/certtest: $(CERT_TEST_OBJ)
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $^ -lssl -lcrypto -lresolv -lpthread -lm
 
 test: $(BUILD)/tgtest $(BUILD)/cryptotest $(BUILD)/conftest $(BUILD)/localtest \
-      $(BUILD)/wdtest $(BUILD)/playouttest $(BUILD)/apptest $(BUILD)/certtest
+      $(BUILD)/wdtest $(BUILD)/playouttest $(BUILD)/apptest $(BUILD)/certtest \
+      $(BUILD)/audiologtest
 	@$(BUILD)/tgtest
 	@$(BUILD)/cryptotest
 	@$(BUILD)/conftest
@@ -267,6 +282,7 @@ test: $(BUILD)/tgtest $(BUILD)/cryptotest $(BUILD)/conftest $(BUILD)/localtest \
 	@$(BUILD)/playouttest
 	@$(BUILD)/apptest
 	@$(BUILD)/certtest
+	@$(BUILD)/audiologtest
 
 # Connection tests: the real client and app core against a fake reflector on
 # loopback (tests/fakerefl.c) — freezes on disconnect/reconnect/PTT, the reason
