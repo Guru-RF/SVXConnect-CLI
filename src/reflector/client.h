@@ -88,6 +88,11 @@ void rc_reconnect_now(rc_client *c);
  * control channel (default 30 s; 0 disables). Mainly for tests. */
 void rc_set_rx_timeout(rc_client *c, int ms);
 
+/* The same for the UDP audio path (default 60 s; 0 disables): once a datagram
+ * has arrived in a session, this long without another logs in again. A
+ * session that never receives any UDP is warned about once, not dropped. */
+void rc_set_udp_rx_timeout(rc_client *c, int ms);
+
 /* Fill `p` with the descriptors to poll. Returns how many were written. */
 int  rc_poll_fds(rc_client *c, struct pollfd *p, int max);
 

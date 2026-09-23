@@ -25,7 +25,11 @@ typedef enum {
     FR_HOLD = 0,        /* read and answer nothing, keep the connection open    */
     FR_ERROR_NOTIFY,    /* send MsgError, then TLS close_notify and close        */
     FR_ERROR_EOF,       /* send MsgError, then close the socket (no close_notify)*/
-    FR_RESET            /* abort the connection with an RST                     */
+    FR_RESET,           /* abort the connection with an RST                     */
+    /* With TCP heartbeats every 200 ms, so the control channel stays alive: */
+    FR_UDP_STEADY,      /* ...and a UDP heartbeat every 100 ms                  */
+    FR_UDP_THEN_QUIET,  /* ...and UDP heartbeats for 500 ms, then no more UDP    */
+    FR_TCP_ONLY         /* ...and never any UDP                                 */
 } fr_after;
 
 typedef struct {
@@ -35,11 +39,13 @@ typedef struct {
 
     int          port;
     int          lfd;
+    int          ufd;                 /* UDP on the same port number           */
     SSL_CTX     *ctx;
     pthread_t    th;
     atomic_int   stop;
     atomic_int   accepts;             /* connections accepted so far           */
     atomic_int   logged_in;           /* logins completed                      */
+    atomic_int   udp_sent;            /* datagrams sent to the client          */
     _Atomic uint64_t client_gone_at;  /* now_ms() when the client's socket closed */
 } fakerefl;
 

@@ -31,6 +31,13 @@
  * dead NAT mapping for ~15 min). */
 #define RC_RX_TIMEOUT_MS 30000
 
+/* The reflector sends a UDP heartbeat about every 15 s between overs (the
+ * user's log: four datagrams a minute). A minute without one while the control
+ * channel is fine means the UDP path closed under us — a NAT mapping that
+ * expired, a firewall change — and audio no longer reaches us, silently. A
+ * new login opens a new mapping. */
+#define RC_UDP_RX_TIMEOUT_MS 60000
+
 /* A MsgError this recent is taken to be the reason for the close that
  * follows it. */
 #define RC_ERROR_REASON_MS 30000
@@ -81,6 +88,9 @@ struct rc_client {
     uint64_t          last_tcp_rx;   /* last complete TCP frame         */
     uint64_t          last_udp_rx;   /* last authenticated datagram     */
     int               rx_timeout_ms; /* 0 disables the watchdog         */
+    int               udp_rx_timeout_ms; /* 0 disables the UDP watchdog */
+    int               udp_seen;      /* a datagram arrived this session */
+    int               udp_never_warned; /* said so once, when none ever did */
     int               rekey_needed;  /* the UDP counter ran out         */
 
     /* The certificate the reflector refused in a TLS handshake. Kept across
@@ -156,6 +166,7 @@ rc_client *rc_new(const svx_config *cfg, const rc_callbacks *cb) {
     c->cb    = *cb;
     c->state = RC_IDLE;
     c->rx_timeout_ms = RC_RX_TIMEOUT_MS;
+    c->udp_rx_timeout_ms = RC_UDP_RX_TIMEOUT_MS;
 
     c->frame = malloc(RC_MAX_FRAME);
     if (!c->frame) { free(c); return NULL; }
@@ -325,6 +336,7 @@ void rc_reconnect_now(rc_client *c) {
 }
 
 void rc_set_rx_timeout(rc_client *c, int ms) { c->rx_timeout_ms = ms > 0 ? ms : 0; }
+void rc_set_udp_rx_timeout(rc_client *c, int ms) { c->udp_rx_timeout_ms = ms > 0 ? ms : 0; }
 
 /* Schedule the next attempt after losing (or failing to make) a connection. */
 static void enter_backoff(rc_client *c, const char *why) {
@@ -634,6 +646,7 @@ static void pump_udp(rc_client *c) {
         c->stats.rx_packets++;
         c->stats.rx_bytes += (uint64_t)n;
         c->last_udp_rx = now_ms();
+        c->udp_seen    = 1;
         if (gap > 0) c->stats.rx_lost += (uint64_t)gap;
 
         uint16_t       type = 0;
@@ -697,6 +710,10 @@ int rc_next_timeout_ms(rc_client *c, uint64_t now) {
             uint64_t dead = c->last_tcp_rx + (uint64_t)c->rx_timeout_ms;
             if (dead < next) next = dead;
         }
+        if (c->udp_rx_timeout_ms > 0 && (c->udp_seen || !c->udp_never_warned)) {
+            uint64_t dead = c->last_udp_rx + (uint64_t)c->udp_rx_timeout_ms;
+            if (dead < next) next = dead;
+        }
     } else if (c->state == RC_BACKOFF && c->backoff_until > 0) {
         if (c->backoff_until < next) next = c->backoff_until;
     }
@@ -718,6 +735,8 @@ static void adopt_connection(rc_client *c, handshake_result *r) {
     c->next_udp_hb = now + SVX_UDP_HEARTBEAT_MS;
     c->conn_since  = c->last_tcp_rx = c->last_udp_rx = now;
     c->rekey_needed    = 0;
+    c->udp_seen        = 0;
+    c->udp_never_warned = 0;
     c->server_error[0] = '\0';
     c->cert_rejected[0] = '\0';     /* whatever we presented was taken */
 
@@ -825,6 +844,34 @@ void rc_service(rc_client *c, uint64_t now) {
                          "no data from the reflector for %d s (after %s) — assuming the link is dead",
                          c->rx_timeout_ms / 1000, age);
                 enter_backoff(c, msg);
+            }
+        }
+
+        /* The same for the audio path. The control channel can stay up while
+         * UDP dies — the two take separate NAT mappings, and TCP's is kept
+         * alive by traffic the UDP one never sees. Only once UDP has worked
+         * this session, though: a reflector (or network) that never sends
+         * any would otherwise be reconnected every minute for nothing. That
+         * case is said once, plainly, instead. */
+        if (c->have_conn && c->udp_rx_timeout_ms > 0) {
+            uint64_t t = now_ms();
+            if (t - c->last_udp_rx >= (uint64_t)c->udp_rx_timeout_ms) {
+                char age[32];
+                fmt_span(age, sizeof(age), t - c->conn_since);
+                if (c->udp_seen) {
+                    char msg[240];
+                    snprintf(msg, sizeof(msg),
+                             "no UDP from the reflector for %d s while the control channel "
+                             "is up (after %s) — the audio path is gone (NAT mapping expired "
+                             "or a firewall change?); logging in again",
+                             c->udp_rx_timeout_ms / 1000, age);
+                    enter_backoff(c, msg);
+                } else if (!c->udp_never_warned) {
+                    c->udp_never_warned = 1;
+                    log_warn("nothing received over UDP from %s:%u in the %s since login — "
+                             "audio cannot reach this machine; a firewall or NAT may be "
+                             "blocking UDP", c->conn.host, c->conn.port, age);
+                }
             }
         }
 

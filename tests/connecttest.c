@@ -32,6 +32,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
+#include <pthread.h>
 #include <unistd.h>
 
 static int g_fail, g_run;
@@ -283,6 +284,105 @@ static void t_rx_watchdog(void) {
     fr_stop(&f);
 }
 
+/* UDP can die while TCP lives: they hold separate NAT mappings, and the
+ * control channel's traffic keeps only its own alive. Audio then stops with
+ * the UI still saying "connected". Once UDP has worked in a session, silence
+ * on it must log in again, and say why. */
+static void t_udp_watchdog(void) {
+    printf("connect: UDP that goes quiet while TCP stays up logs in again\n");
+    fakerefl f = { 0 };
+    CHECK(fr_start(&f, FR_LOGIN, FR_UDP_THEN_QUIET, g_pki, "TEST") == 0 && f.ufd >= 0,
+          "fake reflector did not start");
+
+    rc_client *c = new_client(f.port);
+    rc_set_udp_rx_timeout(c, 1500);
+    rc_start(c);
+    CHECK(run_until(c, RC_CONNECTED, 5000), "never connected: %s", rc_last_error(c));
+    uint64_t t0 = now_ms();
+    run_until(c, -1, 700);
+    rc_stats st;
+    rc_get_stats(c, &st);
+    CHECK(st.rx_packets > 0, "no UDP heartbeat was received (the fake sent %d)",
+          atomic_load(&f.udp_sent));
+    CHECK(rc_get_state(c) == RC_CONNECTED, "dropped while UDP was flowing: %s", rc_last_error(c));
+
+    /* UDP stops ~800 ms after login (300 ms settling + 500 ms of beats). */
+    CHECK(run_until(c, RC_BACKOFF, 4000), "still %s 4 s into the UDP silence",
+          rc_state_name(rc_get_state(c)));
+    uint64_t took = now_ms() - t0;
+    CHECK(took >= 1500 && took <= 3500, "dropped %llu ms after login", (unsigned long long)took);
+    CHECK(strstr(rc_last_error(c), "no UDP from the reflector") &&
+          strstr(rc_last_error(c), "control channel is up"), "reason: '%s'", rc_last_error(c));
+    printf("        %s\n", rc_last_error(c));
+
+    /* It logs in again: a new login is what opens a new mapping. */
+    CHECK(run_until(c, RC_CONNECTED, 5000), "did not log in again: %s", rc_last_error(c));
+    CHECK(atomic_load(&f.logged_in) == 2, "expected a second login, saw %d",
+          atomic_load(&f.logged_in));
+    rc_free(c);
+    fr_stop(&f);
+}
+
+static void t_udp_steady_is_left_alone(void) {
+    printf("connect: steady UDP heartbeats keep the session\n");
+    fakerefl f = { 0 };
+    CHECK(fr_start(&f, FR_LOGIN, FR_UDP_STEADY, g_pki, "TEST") == 0 && f.ufd >= 0,
+          "fake reflector did not start");
+
+    rc_client *c = new_client(f.port);
+    rc_set_udp_rx_timeout(c, 1000);
+    rc_start(c);
+    CHECK(run_until(c, RC_CONNECTED, 5000), "never connected: %s", rc_last_error(c));
+    run_until(c, -1, 3000);
+    CHECK(rc_get_state(c) == RC_CONNECTED, "dropped: %s", rc_last_error(c));
+    rc_stats st;
+    rc_get_stats(c, &st);
+    CHECK(st.rx_packets >= 15, "only %llu datagrams in 3 s", (unsigned long long)st.rx_packets);
+    CHECK(atomic_load(&f.logged_in) == 1, "%d logins", atomic_load(&f.logged_in));
+    rc_free(c);
+    fr_stop(&f);
+}
+
+static pthread_mutex_t g_warn_mu = PTHREAD_MUTEX_INITIALIZER;
+static char            g_warn[512];
+static int             g_warns;
+
+static void warn_sink(int level, const char *line, void *u) {
+    (void)u;
+    if (level > LOG_WARN) return;
+    pthread_mutex_lock(&g_warn_mu);
+    if (strstr(line, "UDP")) { snprintf(g_warn, sizeof(g_warn), "%s", line); g_warns++; }
+    pthread_mutex_unlock(&g_warn_mu);
+}
+
+/* A session in which no UDP ever arrives is not dropped every minute — that
+ * would change nothing — but said once, plainly. */
+static void t_udp_never(void) {
+    printf("connect: UDP that never arrives is warned about once, not reconnected\n");
+    fakerefl f = { 0 };
+    CHECK(fr_start(&f, FR_LOGIN, FR_TCP_ONLY, g_pki, "TEST") == 0, "fake reflector did not start");
+
+    int level = log_get_level();
+    log_set_level(LOG_WARN);
+    g_warns = 0;
+    log_set_sink(warn_sink, NULL);
+
+    rc_client *c = new_client(f.port);
+    rc_set_udp_rx_timeout(c, 800);
+    rc_start(c);
+    CHECK(run_until(c, RC_CONNECTED, 5000), "never connected: %s", rc_last_error(c));
+    run_until(c, -1, 2500);
+    CHECK(rc_get_state(c) == RC_CONNECTED, "dropped: %s", rc_last_error(c));
+    CHECK(atomic_load(&f.logged_in) == 1, "%d logins", atomic_load(&f.logged_in));
+
+    log_set_sink(NULL, NULL);
+    log_set_level(level);
+    CHECK(g_warns == 1 && strstr(g_warn, "nothing received over UDP"),
+          "%d UDP warning(s), last '%s'", g_warns, g_warn);
+    rc_free(c);
+    fr_stop(&f);
+}
+
 /* ----------------------------------------------------- fd lifetime */
 
 /* rc_stop() from a button handler must not close descriptors an event loop
@@ -343,6 +443,9 @@ int main(void) {
     if (want("error-eof"))      t_error_before_close(FR_ERROR_EOF,    "a bare close");
     if (want("reset"))          t_reset_reads_as_reset();
     if (want("watchdog"))       t_rx_watchdog();
+    if (want("udp-watchdog"))   t_udp_watchdog();
+    if (want("udp-steady"))     t_udp_steady_is_left_alone();
+    if (want("udp-never"))      t_udp_never();
     if (want("fds"))            t_fds_close_inside_service();
     if (want("tls-timeout"))    t_tls_handshake_times_out();
 

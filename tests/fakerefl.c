@@ -3,6 +3,7 @@
  */
 #include "fakerefl.h"
 
+#include "common/crypto.h"
 #include "common/proto.h"
 #include "common/util.h"
 
@@ -120,6 +121,65 @@ static void drain_until_gone(fakerefl *f, int fd, SSL *ssl) {
     }
 }
 
+/* ------------------------------------------------------------- UDP */
+
+/* Keep the control channel alive with TCP heartbeats (answering nothing), and
+ * send the client UDP heartbeats under our own key for `udp_ms` (-1: until
+ * the client goes, 0: never). */
+static void heartbeats(fakerefl *f, int fd, SSL *ssl, const uint8_t iv4[4],
+                       const uint8_t key[16], int udp_ms) {
+    crypto_ctx_t cx;
+    crypto_init(&cx);
+    memcpy(cx.tx_iv_rand, iv4, 4);       /* the RX IV layout the client expects */
+    memcpy(cx.tx_key, key, 16);
+    cx.client_id    = 0;
+    cx.sent_initial = 1;                 /* no client id in our AAD */
+
+    /* The client's first datagram tells us where it is. */
+    struct sockaddr_in peer;
+    socklen_t          pl   = sizeof(peer);
+    int                have = 0;
+    uint64_t start = now_ms(), next_tcp = start, next_udp = start;
+    uint8_t  junk[4096];
+
+    while (!atomic_load(&f->stop)) {
+        uint64_t now = now_ms();
+        if (now >= next_tcp) {
+            uint8_t hb[2];
+            be_put_u16(hb, MSG_HEARTBEAT);
+            if (ssl_send_frame(ssl, hb, sizeof(hb)) != 0) break;
+            next_tcp = now + 200;
+        }
+        if (have && udp_ms != 0 && (udp_ms < 0 || now - start < (uint64_t)udp_ms) &&
+            now >= next_udp) {
+            uint8_t pt[16], wire[64];
+            size_t  ptlen;
+            if (proto_build_udp_plaintext(pt, sizeof(pt), &ptlen, UDP_MSG_HEARTBEAT, NULL, 0) == 0) {
+                ssize_t wn = crypto_encrypt_wire(&cx, pt, ptlen, wire, sizeof(wire));
+                if (wn > 0 && sendto(f->ufd, wire, (size_t)wn, 0,
+                                     (struct sockaddr *)&peer, pl) == wn)
+                    atomic_fetch_add(&f->udp_sent, 1);
+            }
+            next_udp = now + 100;
+        }
+
+        struct pollfd p[2] = { { .fd = fd, .events = POLLIN }, { .fd = f->ufd, .events = POLLIN } };
+        if (poll(p, f->ufd >= 0 ? 2 : 1, 20) <= 0) continue;
+        if (p[0].revents) {
+            int r = SSL_read(ssl, junk, sizeof(junk));
+            if (r <= 0 && SSL_get_error(ssl, r) != SSL_ERROR_WANT_READ) {
+                atomic_store(&f->client_gone_at, now_ms());
+                break;
+            }
+        }
+        if (f->ufd >= 0 && p[1].revents) {
+            pl = sizeof(peer);
+            if (recvfrom(f->ufd, junk, sizeof(junk), 0, (struct sockaddr *)&peer, &pl) > 0)
+                have = 1;
+        }
+    }
+}
+
 /* ------------------------------------------------------------- the part */
 
 static void login_and_act(fakerefl *f, int fd) {
@@ -134,11 +194,17 @@ static void login_and_act(fakerefl *f, int fd) {
     be_put_u16(si + 4, 42);
     be_put_u16(si + 6, 0);
     be_put_u16(si + 8, 0);
-    /* An empty StartUdpEncryption: "use your key both ways". */
-    uint8_t su[2];
+    /* StartUdpEncryption. Empty means "use your key both ways"; when we are
+     * going to send UDP ourselves, it carries our own key. */
+    int     udp = f->after == FR_UDP_STEADY || f->after == FR_UDP_THEN_QUIET ||
+                  f->after == FR_TCP_ONLY;
+    uint8_t su[2 + 4 + 16], iv4[4] = { 1, 2, 3, 4 }, key[16];
+    for (int i = 0; i < 16; i++) key[i] = (uint8_t)(0xa0 + i);
     be_put_u16(su, MSG_START_UDP_ENCRYPTION);
+    memcpy(su + 2, iv4, 4);
+    memcpy(su + 6, key, 16);
     if (ssl_send_frame(ssl, si, sizeof(si)) != 0 ||
-        ssl_send_frame(ssl, su, sizeof(su)) != 0) { SSL_free(ssl); return; }
+        ssl_send_frame(ssl, su, udp ? sizeof(su) : 2) != 0) { SSL_free(ssl); return; }
     atomic_fetch_add(&f->logged_in, 1);
 
     /* Let the client adopt the connection and settle. */
@@ -170,6 +236,9 @@ static void login_and_act(fakerefl *f, int fd) {
         setsockopt(fd, SOL_SOCKET, SO_LINGER, &lg, sizeof(lg));
         break;
     }
+    case FR_UDP_STEADY:     heartbeats(f, fd, ssl, iv4, key, -1);  break;
+    case FR_UDP_THEN_QUIET: heartbeats(f, fd, ssl, iv4, key, 500); break;
+    case FR_TCP_ONLY:       heartbeats(f, fd, ssl, iv4, key, 0);   break;
     }
     SSL_free(ssl);
 }
@@ -231,6 +300,7 @@ int fr_start(fakerefl *f, fr_mode mode, fr_after after, const char *pki_dir,
              const char *callsign) {
     const char *text = f->error_text;
     memset(f, 0, sizeof(*f));
+    f->ufd        = -1;
     f->mode       = mode;
     f->after      = after;
     f->error_text = text;
@@ -254,6 +324,14 @@ int fr_start(fakerefl *f, fr_mode mode, fr_after after, const char *pki_dir,
         getsockname(f->lfd, (struct sockaddr *)&a, &al) != 0) return -1;
     f->port = ntohs(a.sin_port);
 
+    /* The client sends UDP to the port it connected to over TCP. The number
+     * is free for TCP; for UDP it almost always is too. */
+    f->ufd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (f->ufd >= 0 && bind(f->ufd, (struct sockaddr *)&a, sizeof(a)) != 0) {
+        close(f->ufd);
+        f->ufd = -1;
+    }
+
     g_n_handlers = 0;
     return pthread_create(&f->th, NULL, accept_main, f) == 0 ? 0 : -1;
 }
@@ -266,5 +344,6 @@ void fr_stop(fakerefl *f) {
     g_n_handlers = 0;
     pthread_mutex_unlock(&g_mu);
     close(f->lfd);
+    if (f->ufd >= 0) close(f->ufd);
     SSL_CTX_free(f->ctx);
 }
