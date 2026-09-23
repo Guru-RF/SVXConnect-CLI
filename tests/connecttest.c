@@ -36,6 +36,10 @@
 #include <poll.h>
 #include <pthread.h>
 #include <unistd.h>
+#include <sys/wait.h>
+#ifdef __linux__
+#include <sys/prctl.h>
+#endif
 
 static int g_fail, g_run;
 
@@ -126,6 +130,23 @@ static void on_test_timeout(int sig) {
     for (const char *s = c; *s; s++) msg[n++] = *s;
     ssize_t w = write(STDOUT_FILENO, msg, n);
     (void)w;
+#ifdef __linux__
+    /* And where every thread is stuck, if eu-stack is there to say: the one
+     * hang seen so far left nothing but a kernel wait channel. fork, execve
+     * and waitpid are all async-signal-safe. */
+    char pid[16];
+    size_t pn = 0;
+    put_int(pid, &pn, (int)getpid());
+    pid[pn] = '\0';
+    pid_t k = fork();
+    if (k == 0) {
+        char *argv[] = { "eu-stack", "-p", pid, NULL }, *envp[] = { NULL };
+        dup2(STDOUT_FILENO, STDERR_FILENO);
+        execve("/usr/bin/eu-stack", argv, envp);
+        _exit(127);
+    }
+    if (k > 0) waitpid(k, NULL, 0);
+#endif
     _exit(2);
 }
 
@@ -463,6 +484,9 @@ static void t_fds_close_inside_service(void) {
 int main(void) {
     signal(SIGPIPE, SIG_IGN);
     signal(SIGALRM, on_test_timeout);
+#ifdef __linux__
+    prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY);        /* for eu-stack, above */
+#endif
     g_limit_s   = getenv("CONNECTTEST_TIMEOUT") ? atoi(getenv("CONNECTTEST_TIMEOUT")) : 0;
     g_current_s = g_limit_s ? g_limit_s : 60;
     alarm((unsigned)g_current_s);                     /* setup: keys, certificates */
