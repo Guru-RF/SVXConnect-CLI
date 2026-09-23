@@ -11,7 +11,9 @@
  * throwaway CA, and against a small in-process reflector that speaks enough of
  * the protocol to log in, ask for a CSR, sign it, and push a renewal.
  *
- * Run with `make test`. CERTTEST_VERBOSE=1 shows the client's log.
+ * Run with `make test`. CERTTEST_VERBOSE=1 shows the client's log. Each test
+ * has a 60 s limit; past it the run stops and names the test.
+ * CERTTEST_TIMEOUT=secs overrides the limit.
  */
 #include "common/config.h"
 #include "common/log.h"
@@ -25,6 +27,7 @@
 #include <errno.h>
 #include <poll.h>
 #include <pthread.h>
+#include <signal.h>
 #include <stdarg.h>
 #include <stdatomic.h>
 #include <stdio.h>
@@ -54,6 +57,46 @@ static int g_fail, g_run;
 
 #define DAY  86400L
 #define CALL "ON0TEST"
+
+/* ------------------------------------------------------ per-test timeout */
+
+/* A plain run of this suite hung once and would not do it again. If it does,
+ * it must at least say where: each test runs under an alarm, and the handler
+ * names the test that was running and fails the run. Only async-signal-safe
+ * calls in the handler — write(), not printf(). */
+static const char *volatile g_current = "setup";
+static volatile int          g_current_s;
+static int                   g_limit_s;      /* CERTTEST_TIMEOUT=secs overrides every limit */
+
+static void put_int(char *p, size_t *n, int v) {
+    char d[12];
+    int  k = 0;
+    do { d[k++] = (char)('0' + v % 10); v /= 10; } while (v > 0 && k < 11);
+    while (k > 0) p[(*n)++] = d[--k];
+}
+
+static void on_test_timeout(int sig) {
+    (void)sig;
+    char   msg[512];
+    size_t n = 0;
+    const char *a = "\n  TIMEOUT  ", *b = " still running after ", *c = " s\n";
+    for (const char *s = a; *s; s++) msg[n++] = *s;
+    for (const char *s = g_current; *s && n < 400; s++) msg[n++] = *s;
+    for (const char *s = b; *s; s++) msg[n++] = *s;
+    put_int(msg, &n, g_current_s);
+    for (const char *s = c; *s; s++) msg[n++] = *s;
+    ssize_t w = write(STDOUT_FILENO, msg, n);
+    (void)w;
+    _exit(2);
+}
+
+/* Run one test under a `secs` alarm. */
+#define RUN(secs, call) do {                                  \
+    g_current = #call; g_current_s = g_limit_s ? g_limit_s : (secs); \
+    alarm((unsigned)g_current_s);                              \
+    call;                                      \
+    alarm(0);                                  \
+} while (0)
 
 /* ------------------------------------------------------------ log capture */
 
@@ -960,6 +1003,10 @@ static void t_enroll_wrong_cert(void) {
 
 int main(void) {
     g_verbose = getenv("CERTTEST_VERBOSE") != NULL;
+    signal(SIGALRM, on_test_timeout);
+    g_limit_s   = getenv("CERTTEST_TIMEOUT") ? atoi(getenv("CERTTEST_TIMEOUT")) : 0;
+    g_current_s = g_limit_s ? g_limit_s : 60;
+    alarm((unsigned)g_current_s);                     /* setup: keys, certificates */
     log_set_level(LOG_DBG);
     log_set_sink(sink, NULL);
 
@@ -976,20 +1023,20 @@ int main(void) {
     snprintf(g_cfg.email,     sizeof(g_cfg.email),     "test@example.invalid");
     snprintf(g_cfg.reflector, sizeof(g_cfg.reflector), "127.0.0.1");
 
-    t_status();
-    t_expired_file_detected();
-    t_banner();
-    t_push();
-    t_csr_keeps_key();
-    t_expired_login_requests_new_cert();
-    t_expired_login_unsigned();
-    t_midsession_push(1);
-    t_midsession_push(0);
-    t_refused_login_requests_new_cert(1);
-    t_refused_login_requests_new_cert(0);
-    t_refused_across_attempts();
-    t_enroll_expired();
-    t_enroll_wrong_cert();
+    RUN(60, t_status());
+    RUN(60, t_expired_file_detected());
+    RUN(60, t_banner());
+    RUN(60, t_push());
+    RUN(60, t_csr_keeps_key());
+    RUN(60, t_expired_login_requests_new_cert());
+    RUN(60, t_expired_login_unsigned());
+    RUN(60, t_midsession_push(1));
+    RUN(60, t_midsession_push(0));
+    RUN(60, t_refused_login_requests_new_cert(1));
+    RUN(60, t_refused_login_requests_new_cert(0));
+    RUN(60, t_refused_across_attempts());
+    RUN(60, t_enroll_expired());
+    RUN(60, t_enroll_wrong_cert());
 
     printf("\n%d checks, %d failed\n\n", g_run, g_fail);
     return g_fail ? 1 : 0;

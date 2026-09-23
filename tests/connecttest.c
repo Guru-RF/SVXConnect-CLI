@@ -14,7 +14,9 @@
  * Run with `make check` (also under TSan and ASan: `make check-tsan`,
  * `make check-asan`). The TLS handshake timeout test waits the full 15 s.
  * CONNECTTEST_ONLY=stop-silent,fds,... runs a subset; CONNECTTEST_DEBUG=1
- * shows the client's own log.
+ * shows the client's own log. Each test has a time limit (60 s, 90 s for the
+ * TLS timeout); past it the run stops and names the test.
+ * CONNECTTEST_TIMEOUT=secs overrides every limit.
  */
 #include "fakerefl.h"
 
@@ -94,6 +96,46 @@ static int want(const char *name) {
 }
 
 static int fd_open(int fd) { return fcntl(fd, F_GETFD) != -1 || errno != EBADF; }
+
+/* ------------------------------------------------------ per-test timeout */
+
+/* A plain run of this suite hung once and would not do it again. If it does,
+ * it must at least say where: each test runs under an alarm, and the handler
+ * names the test that was running and fails the run. Only async-signal-safe
+ * calls in the handler — write(), not printf(). */
+static const char *volatile g_current = "setup";
+static volatile int          g_current_s;
+static int                   g_limit_s;      /* CONNECTTEST_TIMEOUT=secs overrides every limit */
+
+static void put_int(char *p, size_t *n, int v) {
+    char d[12];
+    int  k = 0;
+    do { d[k++] = (char)('0' + v % 10); v /= 10; } while (v > 0 && k < 11);
+    while (k > 0) p[(*n)++] = d[--k];
+}
+
+static void on_test_timeout(int sig) {
+    (void)sig;
+    char   msg[512];
+    size_t n = 0;
+    const char *a = "\n  TIMEOUT  ", *b = " still running after ", *c = " s\n";
+    for (const char *s = a; *s; s++) msg[n++] = *s;
+    for (const char *s = g_current; *s && n < 400; s++) msg[n++] = *s;
+    for (const char *s = b; *s; s++) msg[n++] = *s;
+    put_int(msg, &n, g_current_s);
+    for (const char *s = c; *s; s++) msg[n++] = *s;
+    ssize_t w = write(STDOUT_FILENO, msg, n);
+    (void)w;
+    _exit(2);
+}
+
+/* Run one test under a `secs` alarm. */
+#define RUN(secs, call) do {                                  \
+    g_current = #call; g_current_s = g_limit_s ? g_limit_s : (secs); \
+    alarm((unsigned)g_current_s);                              \
+    call;                                      \
+    alarm(0);                                  \
+} while (0)
 
 /* ------------------------------------------------------------ freezes */
 
@@ -420,6 +462,10 @@ static void t_fds_close_inside_service(void) {
 
 int main(void) {
     signal(SIGPIPE, SIG_IGN);
+    signal(SIGALRM, on_test_timeout);
+    g_limit_s   = getenv("CONNECTTEST_TIMEOUT") ? atoi(getenv("CONNECTTEST_TIMEOUT")) : 0;
+    g_current_s = g_limit_s ? g_limit_s : 60;
+    alarm((unsigned)g_current_s);                     /* setup: keys, certificates */
     setvbuf(stdout, NULL, _IOLBF, 0);
 
     snprintf(g_pki, sizeof(g_pki), "/tmp/svxconnect-test-XXXXXX");
@@ -435,19 +481,19 @@ int main(void) {
     /* Quiet unless asked: the tests provoke plenty of errors on purpose. */
     log_set_level(getenv("CONNECTTEST_DEBUG") ? LOG_DBG : LOG_ERR);
 
-    if (want("stop-silent"))    t_stop_does_not_block(FR_SILENT,    "the server is silent");
-    if (want("stop-stall-tls")) t_stop_does_not_block(FR_STALL_TLS, "the TLS handshake is stalled");
-    if (want("reconnect"))      t_reconnect_does_not_block();
-    if (want("ptt"))            t_ptt_while_connecting();
-    if (want("error-notify"))   t_error_before_close(FR_ERROR_NOTIFY, "close_notify");
-    if (want("error-eof"))      t_error_before_close(FR_ERROR_EOF,    "a bare close");
-    if (want("reset"))          t_reset_reads_as_reset();
-    if (want("watchdog"))       t_rx_watchdog();
-    if (want("udp-watchdog"))   t_udp_watchdog();
-    if (want("udp-steady"))     t_udp_steady_is_left_alone();
-    if (want("udp-never"))      t_udp_never();
-    if (want("fds"))            t_fds_close_inside_service();
-    if (want("tls-timeout"))    t_tls_handshake_times_out();
+    if (want("stop-silent"))    RUN(60, t_stop_does_not_block(FR_SILENT,    "the server is silent"));
+    if (want("stop-stall-tls")) RUN(60, t_stop_does_not_block(FR_STALL_TLS, "the TLS handshake is stalled"));
+    if (want("reconnect"))      RUN(60, t_reconnect_does_not_block());
+    if (want("ptt"))            RUN(60, t_ptt_while_connecting());
+    if (want("error-notify"))   RUN(60, t_error_before_close(FR_ERROR_NOTIFY, "close_notify"));
+    if (want("error-eof"))      RUN(60, t_error_before_close(FR_ERROR_EOF,    "a bare close"));
+    if (want("reset"))          RUN(60, t_reset_reads_as_reset());
+    if (want("watchdog"))       RUN(60, t_rx_watchdog());
+    if (want("udp-watchdog"))   RUN(60, t_udp_watchdog());
+    if (want("udp-steady"))     RUN(60, t_udp_steady_is_left_alone());
+    if (want("udp-never"))      RUN(60, t_udp_never());
+    if (want("fds"))            RUN(60, t_fds_close_inside_service());
+    if (want("tls-timeout"))    RUN(90, t_tls_handshake_times_out());
 
     char cmd[300];
     snprintf(cmd, sizeof(cmd), "rm -rf '%s'", g_pki);
