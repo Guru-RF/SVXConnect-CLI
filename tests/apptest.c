@@ -53,6 +53,11 @@ static svx_app *start_app(void) {
     g_cfg.idle_seconds   = 0;
     g_cfg.ctl_fifo[0]    = '\0';
     g_cfg.status_file[0] = '\0';
+    /* Never the user's real ~/.config/svxconnect/pki. There is no certificate
+     * here, so the core raises its "no certificate" banner — which is why the
+     * banner checks below look for the audio banner by name rather than for
+     * no banner at all. */
+    snprintf(g_cfg.pki_dir, sizeof(g_cfg.pki_dir), "/nonexistent/svxconnect-apptest/pki");
     g_n_log = 0;
     stub_rc_set_state(RC_CONNECTED);
 
@@ -179,7 +184,9 @@ static void t_dead_speaker_is_reopened(void) {
     CHECK(fake_opens(0) == opens + 1, "the output device should be reopened (%d)",
           fake_opens(0) - opens);
     CHECK(logged(LOG_WARN, "output device stopped playing"), "and it says so");
-    CHECK(!app_banner(a), "a reopen that works raises no banner");
+    CHECK(!app_banner(a) || !strstr(app_banner(a), "STALLED"),
+          "a reopen that works raises no audio banner (%s)",
+          app_banner(a) ? app_banner(a) : "none");
     app_free(a);
 }
 
