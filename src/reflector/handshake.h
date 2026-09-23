@@ -37,6 +37,8 @@ typedef struct {
     char                host[256];    /* what we actually connected to */
     uint16_t            port;
 
+    int                 cert_renewed; /* failed only because a new certificate
+                                         was just stored: reconnect at once */
     char                err[256];     /* human-readable failure reason */
 } handshake_result;
 
