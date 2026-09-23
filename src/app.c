@@ -893,6 +893,10 @@ svx_app *app_new(const svx_config *cfg, int no_tx) {
 
     a->cfg      = cfg;
     a->no_tx    = no_tx;
+    /* No control FIFO until app_start() opens one. calloc left the fd at 0,
+     * and app_service() would then block reading stdin, app_poll_fds() would
+     * offer it, and app_free() would close it. */
+    a->ctl.fd   = -1;
     a->out_muted = 0;
     a->volume_before_mute = cfg->output_volume_pct;
     snprintf(a->owner_kind, sizeof(a->owner_kind), "cli");

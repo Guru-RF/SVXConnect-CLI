@@ -249,6 +249,14 @@ static void t_ptt_while_connecting(void) {
     int level = log_get_level();
     log_set_level(LOG_DBG);            /* into the ring below, not the terminal */
     svx_app *a = app_new(&g_cfg, 1);
+
+    /* This app is never app_start()ed, so it has no control FIFO. It used to
+     * take fd 0 for one: app_service() then blocked reading stdin — the hang
+     * `make check` showed now and then, depending on what stdin was. */
+    struct pollfd pf[8];
+    int npf = app_poll_fds(a, pf, 8), offers_stdin = 0;
+    for (int i = 0; i < npf; i++) if (pf[i].fd == STDIN_FILENO) offers_stdin = 1;
+    CHECK(!offers_stdin, "an app with no control FIFO offers stdin to poll");
     app_capture_log(a);                /* the worker now logs into the app's ring */
     app_reconnect(a);
     for (int i = 0; i < 20; i++) {     /* main-thread logging racing the worker's */
@@ -280,6 +288,7 @@ static void t_ptt_while_connecting(void) {
     CHECK(saw_refusal, "no 'PTT refused: still connecting' in the log");
 
     app_free(a);
+    CHECK(fd_open(STDIN_FILENO), "app_free closed stdin");
     log_set_level(level);
     fr_stop(&f);
 }
@@ -491,6 +500,13 @@ int main(void) {
     g_current_s = g_limit_s ? g_limit_s : 60;
     alarm((unsigned)g_current_s);                     /* setup: keys, certificates */
     setvbuf(stdout, NULL, _IOLBF, 0);
+
+    /* Nothing here reads stdin. Make it a pipe that stays open and empty, so
+     * that anything which does blocks the same way every run — under a
+     * terminal it blocked, from /dev/null it did not, and the suite hung only
+     * sometimes. The write end stays open for the whole run. */
+    int in[2];
+    if (pipe(in) == 0) { dup2(in[0], STDIN_FILENO); close(in[0]); }
 
     snprintf(g_pki, sizeof(g_pki), "/tmp/svxconnect-test-XXXXXX");
     if (!mkdtemp(g_pki)) { perror("mkdtemp"); return 1; }
