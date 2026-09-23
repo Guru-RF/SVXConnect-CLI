@@ -14,10 +14,35 @@
 
 /* ------------------------------------------------------------ plain fd */
 
+/* Wait for `events` on `fd` until `deadline`, in slices so that an abort
+ * is noticed promptly. Returns 1 when ready, -1 with errno set otherwise. */
+static int wait_fd(int fd, short events, uint64_t deadline, const atomic_int *abort_flag) {
+    for (;;) {
+        if (abort_flag && atomic_load(abort_flag)) { errno = ECANCELED; return -1; }
+
+        uint64_t now = now_ms();
+        if (now >= deadline) { errno = ETIMEDOUT; return -1; }
+
+        uint64_t left = deadline - now;
+        struct pollfd pf = { .fd = fd, .events = events };
+        int pr = poll(&pf, 1, (int)(left < FIO_SLICE_MS ? left : FIO_SLICE_MS));
+        if (pr < 0) { if (errno == EINTR) continue; return -1; }
+        if (pr > 0) return 1;
+    }
+}
+
 int fio_raw_send(int fd, const uint8_t *p, size_t len) {
+    uint64_t deadline = now_ms() + FIO_SEND_MS;
     while (len > 0) {
         ssize_t n = send(fd, p, len, 0);
-        if (n < 0) { if (errno == EINTR) continue; return -1; }
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                if (wait_fd(fd, POLLOUT, deadline, NULL) < 0) return -1;
+                continue;
+            }
+            return -1;
+        }
         if (n == 0) return -1;
         p += n; len -= (size_t)n;
     }
@@ -25,20 +50,15 @@ int fio_raw_send(int fd, const uint8_t *p, size_t len) {
 }
 
 static int raw_recv_all(int fd, uint8_t *p, size_t len, uint64_t deadline,
-                        volatile sig_atomic_t *abort_flag) {
+                        const atomic_int *abort_flag) {
     while (len > 0) {
-        if (abort_flag && *abort_flag) { errno = ECANCELED; return -1; }
-
-        uint64_t now = now_ms();
-        if (now >= deadline) { errno = ETIMEDOUT; return -1; }
-
-        struct pollfd pf = { .fd = fd, .events = POLLIN };
-        int pr = poll(&pf, 1, (int)(deadline - now));
-        if (pr < 0) { if (errno == EINTR) continue; return -1; }
-        if (pr == 0) { errno = ETIMEDOUT; return -1; }
+        if (wait_fd(fd, POLLIN, deadline, abort_flag) < 0) return -1;
 
         ssize_t n = recv(fd, p, len, 0);
-        if (n < 0) { if (errno == EINTR) continue; return -1; }
+        if (n < 0) {
+            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) continue;
+            return -1;
+        }
         if (n == 0) { errno = ECONNRESET; return -1; }
         p += n; len -= (size_t)n;
     }
@@ -46,7 +66,7 @@ static int raw_recv_all(int fd, uint8_t *p, size_t len, uint64_t deadline,
 }
 
 ssize_t fio_raw_recv_frame(int fd, uint8_t *buf, size_t cap, int timeout_ms,
-                           volatile sig_atomic_t *abort_flag) {
+                           const atomic_int *abort_flag) {
     uint64_t deadline = now_ms() + (uint64_t)timeout_ms;
 
     uint8_t hdr[4];
@@ -68,7 +88,7 @@ int fio_tls_send(tls_conn_t *t, const uint8_t *buf, size_t len) {
 }
 
 ssize_t fio_tls_recv_frame(tls_conn_t *t, uint8_t *buf, size_t cap,
-                           int timeout_ms, volatile sig_atomic_t *abort_flag) {
+                           int timeout_ms, const atomic_int *abort_flag) {
     uint64_t deadline = now_ms() + (uint64_t)timeout_ms;
 
     for (;;) {
@@ -87,23 +107,27 @@ ssize_t fio_tls_recv_frame(tls_conn_t *t, uint8_t *buf, size_t cap,
             }
         }
 
-        if (abort_flag && *abort_flag) { errno = ECANCELED; return -1; }
+        /* The peer hung up after its last complete frame (served above). */
+        if (tls_failed(t)) { errno = ECONNRESET; return -1; }
+
+        if (abort_flag && atomic_load(abort_flag)) { errno = ECANCELED; return -1; }
         uint64_t now = now_ms();
         if (now >= deadline) { errno = ETIMEDOUT; return -1; }
 
         if (tls_flush(t) != 0) return -1;
 
+        uint64_t left = deadline - now;
         struct pollfd pf = {
             .fd     = t->fd,
             .events = (short)(POLLIN | (tls_want_write(t) ? POLLOUT : 0))
         };
-        int pr = poll(&pf, 1, (int)(deadline - now));
+        int pr = poll(&pf, 1, (int)(left < FIO_SLICE_MS ? left : FIO_SLICE_MS));
         if (pr < 0) { if (errno == EINTR) continue; return -1; }
-        if (pr == 0) { errno = ETIMEDOUT; return -1; }
+        if (pr == 0) continue;                 /* re-check abort and deadline */
 
         if (pf.revents & POLLOUT) { if (tls_flush(t) != 0) return -1; }
         if (pf.revents & (POLLIN | POLLHUP | POLLERR)) {
-            if (tls_pump_in(t) < 0) return -1;
+            if (tls_pump_in(t) < 0) { errno = ECONNRESET; return -1; }
         }
     }
 }
@@ -116,7 +140,7 @@ int fio_send(tls_conn_t *t, int fd, const uint8_t *buf, size_t len) {
 }
 
 ssize_t fio_recv_frame(tls_conn_t *t, int fd, uint8_t *buf, size_t cap,
-                       int timeout_ms, volatile sig_atomic_t *abort_flag) {
+                       int timeout_ms, const atomic_int *abort_flag) {
     if (t && t->ssl) return fio_tls_recv_frame(t, buf, cap, timeout_ms, abort_flag);
     return fio_raw_recv_frame(fd, buf, cap, timeout_ms, abort_flag);
 }

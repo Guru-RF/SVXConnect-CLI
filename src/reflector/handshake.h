@@ -15,7 +15,7 @@
 #define SVX_HANDSHAKE_H
 
 #include <stdint.h>
-#include <signal.h>
+#include <stdatomic.h>
 #include <netinet/in.h>
 
 #include "common/config.h"
@@ -44,10 +44,11 @@ typedef struct {
  *
  * Returns 0 on success, with every field of *out populated and owned by the
  * caller. On failure returns -1, out->err explains why, and nothing needs
- * freeing. Set *abort_flag from another thread to give up early.
+ * freeing. Set *abort_flag from another thread to give up early: every wait
+ * after name resolution notices it within about 100 ms.
  */
 int handshake_run(const svx_config *cfg, handshake_result *out,
-                  volatile sig_atomic_t *abort_flag);
+                  const atomic_int *abort_flag);
 
 /* Release everything a successful handshake_run() produced. */
 void handshake_release(handshake_result *r);

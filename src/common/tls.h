@@ -22,8 +22,22 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <stdatomic.h>
 #include <sys/types.h>
 #include <openssl/ssl.h>
+
+/* Why a connection stopped working. The caller logs this at info level, so a
+ * reflector that hangs up can be told from a path that died or a TLS alert —
+ * they call for different remedies and used to read identically. */
+typedef enum {
+    TLS_CLOSE_NONE = 0,    /* still open                                        */
+    TLS_CLOSE_NOTIFY,      /* the peer sent a TLS close_notify                  */
+    TLS_CLOSE_EOF,         /* TCP FIN with no close_notify                      */
+    TLS_CLOSE_RESET,       /* ECONNRESET: the peer or a middlebox aborted it    */
+    TLS_CLOSE_NETWORK,     /* another socket error: ETIMEDOUT, EHOSTUNREACH ... */
+    TLS_CLOSE_ALERT,       /* a TLS alert or protocol error                     */
+    TLS_CLOSE_LOCAL        /* our own limit or an allocation failed             */
+} tls_close_kind;
 
 typedef struct {
     SSL_CTX *ctx;              /* not owned; the caller frees it */
@@ -39,6 +53,9 @@ typedef struct {
 
     int      want_write;       /* SSL_write returned WANT_WRITE: arm POLLOUT */
     int      failed;
+
+    tls_close_kind close_kind; /* set together with `failed`                   */
+    char           close_detail[160];   /* errno text or OpenSSL reason     */
 } tls_conn_t;
 
 void tls_global_init(void);
@@ -50,12 +67,19 @@ SSL_CTX *tls_make_ctx(const char *ca_bundle_path,
                       const char *cert_path,
                       const char *key_path);
 
-/* Wrap an existing connected fd and perform the handshake BLOCKING. The fd is
- * switched to non-blocking afterwards. Returns 0 on success.
+/* Wrap an existing connected fd and perform the handshake. Returns 0 on
+ * success; the fd is left non-blocking either way.
  *
- * A blocking handshake is deliberate: it runs on the connect worker thread,
- * where blocking costs nothing, and a non-blocking SSL_connect state machine
- * is a lot of code that can only introduce bugs the blocking one cannot have. */
+ * The call blocks the calling thread (the connect worker, or --enroll) until
+ * the handshake completes, but never longer than `timeout_ms`, and it gives up
+ * within about 100 ms of `*abort_flag` becoming non-zero. A server that
+ * answers StartEncryption and then never speaks TLS used to hold SSL_connect()
+ * — and whoever waited for it — forever. On failure errno is ETIMEDOUT,
+ * ECANCELED, or EPROTO for a handshake the peer refused. */
+int tls_start_ex(tls_conn_t *t, SSL_CTX *ctx, int fd, int timeout_ms,
+                 const atomic_int *abort_flag);
+
+/* tls_start_ex() with a 15 s limit and no abort flag. */
 int tls_start(tls_conn_t *t, SSL_CTX *ctx, int fd);
 
 /* Queue bytes for sending. Never blocks; grows the queue as needed.
@@ -71,8 +95,22 @@ int tls_want_write(const tls_conn_t *t);
 
 /* Read whatever is available into the inbound buffer.
  * Returns  1 when bytes were added, 0 when there was nothing to read,
- *         -1 on a closed connection or a fatal error. */
+ *         -1 on a closed connection or a fatal error.
+ *
+ * A peer that sends a last message and hangs up delivers both in one go —
+ * the reflector does exactly that with MsgError. So when the connection ends
+ * after new bytes arrived, this returns 1, keeps the bytes, and records the
+ * end in tls_failed()/close_kind; the next call returns -1. Callers drain the
+ * frames first and then check tls_failed(). */
 int tls_pump_in(tls_conn_t *t);
+
+/* Non-zero once the connection is unusable; close_kind says why. */
+int tls_failed(const tls_conn_t *t);
+
+/* close_kind and close_detail as one short phrase, e.g. "TLS close_notify",
+ * "ECONNRESET" or "TLS error: sslv3 alert certificate expired". Writes into
+ * `buf` and returns it. */
+const char *tls_close_describe(const tls_conn_t *t, char *buf, size_t cap);
 
 /* Bytes sitting in the inbound buffer. */
 size_t tls_pending(const tls_conn_t *t);
@@ -90,7 +128,7 @@ void tls_consume(tls_conn_t *t, size_t n);
  * the TCP connection instead, which the server handles cleanly. */
 void tls_close(tls_conn_t *t);
 
-/* Last OpenSSL error as a string, for logging. */
+/* Last OpenSSL error as a string, for logging. The buffer is per thread. */
 const char *tls_last_error(void);
 
 #endif

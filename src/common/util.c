@@ -48,7 +48,8 @@ char *read_file(const char *path, size_t *out_len) {
     return buf;
 }
 
-int write_file_atomic(const char *path, const void *data, size_t len, int mode) {
+static int write_replace(const char *path, const void *data, size_t len, int mode,
+                         int durable) {
     char tmp[1024];
     if ((size_t)snprintf(tmp, sizeof(tmp), "%s.tmp", path) >= sizeof(tmp)) {
         errno = ENAMETOOLONG;
@@ -68,10 +69,18 @@ int write_file_atomic(const char *path, const void *data, size_t len, int mode) 
         if (n < 0) { if (errno == EINTR) continue; close(fd); unlink(tmp); return -1; }
         p += n; left -= (size_t)n;
     }
-    if (fsync(fd) != 0)  { close(fd); unlink(tmp); return -1; }
+    if (durable && fsync(fd) != 0) { close(fd); unlink(tmp); return -1; }
     if (close(fd) != 0)  { unlink(tmp); return -1; }
     if (rename(tmp, path) != 0) { unlink(tmp); return -1; }
     return 0;
+}
+
+int write_file_atomic(const char *path, const void *data, size_t len, int mode) {
+    return write_replace(path, data, len, mode, 1);
+}
+
+int write_file_replace(const char *path, const void *data, size_t len, int mode) {
+    return write_replace(path, data, len, mode, 0);
 }
 
 int mkdir_p(const char *path, int mode) {

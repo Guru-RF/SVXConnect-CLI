@@ -6,6 +6,7 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include <stdatomic.h>
 #include <netinet/in.h>
 
 #define SVX_MAX_SRV 8
@@ -33,6 +34,14 @@ int net_srv_resolve(const char *domain, svx_srv *out, int max);
  * same server even when the name resolves to several addresses. */
 int net_tcp_connect(const char *host, uint16_t port, int timeout_ms,
                     struct sockaddr_in *out_addr);
+
+/* The connect worker's version: gives up within about 100 ms of *abort_flag
+ * becoming non-zero (errno ECANCELED), and leaves the socket NON-blocking —
+ * every later wait on it is a poll() that also watches the abort flag. Name
+ * resolution itself (getaddrinfo) cannot be interrupted; the caller must not
+ * wait for it (see client.c). */
+int net_tcp_connect_ex(const char *host, uint16_t port, int timeout_ms,
+                       struct sockaddr_in *out_addr, const atomic_int *abort_flag);
 
 /* Create an unconnected UDP socket and resolve host:port into *out_addr.
  *

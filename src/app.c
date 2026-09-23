@@ -22,6 +22,7 @@
 #include <unistd.h>
 #include <errno.h>
 #include <poll.h>
+#include <pthread.h>
 
 struct svx_app {
     const svx_config *cfg;
@@ -68,7 +69,11 @@ struct svx_app {
     char              banner[240];
 
     /* Log ring, so the interface can show recent lines without reopening the
-     * log file. Fed by the sink installed in app_new(). */
+     * log file. Fed by the sink installed in app_capture_log(). The connect
+     * worker logs too, from its own thread, so the ring has its own lock:
+     * log.c serialises the writers, but the readers are on the main thread. */
+    pthread_mutex_t   log_mu;
+    int               log_captured;
     app_log_line      logbuf[APP_LOG_LINES];
     int               log_head;      /* next slot to write */
     int               log_count;
@@ -248,10 +253,14 @@ static void tx_beep(svx_app *a, int count) {
 static int tx_start(svx_app *a) {
     /* The guard chain, in this order. Each refusal has its own beep so the
      * reason is audible without looking at the screen. */
-    if (rc_get_state(a->rc) != RC_CONNECTED) {
-        log_warn("PTT refused: not connected");
+    rc_state link = rc_get_state(a->rc);
+    if (link != RC_CONNECTED) {
+        log_warn("PTT refused: %s", link == RC_CONNECTING ? "still connecting" : "not connected");
         tx_beep(a, 3);
-        rc_reconnect_now(a->rc);
+        /* Nudge a stopped or backing-off link, but leave a connect in flight
+         * alone: restarting it threw the login away on every press, so a user
+         * who kept pressing could stop it from ever completing. */
+        if (link != RC_CONNECTING) rc_reconnect_now(a->rc);
         return -1;
     }
     if (tgm_selected(&a->tgm) == 0) {
@@ -519,6 +528,7 @@ static void ctl_quit(void *u) { ((svx_app *)u)->quit = 1; }
 static void app_log_sink(int level, const char *line, void *user) {
     svx_app *a = user;
 
+    pthread_mutex_lock(&a->log_mu);
     app_log_line *slot = &a->logbuf[a->log_head];
     slot->level = level;
     snprintf(slot->text, sizeof(slot->text), "%s", line);
@@ -526,17 +536,27 @@ static void app_log_sink(int level, const char *line, void *user) {
     a->log_head = (a->log_head + 1) % APP_LOG_LINES;
     if (a->log_count < APP_LOG_LINES) a->log_count++;
     a->log_serial++;
+    pthread_mutex_unlock(&a->log_mu);
 }
 
 int app_log_snapshot(const svx_app *a, app_log_line *out, int max) {
+    svx_app *m = (svx_app *)a;          /* the lock, not the ring, is mutated */
+    pthread_mutex_lock(&m->log_mu);
     int n = a->log_count < max ? a->log_count : max;
     /* Oldest first, so the caller can print top to bottom. */
     int start = (a->log_head - n + APP_LOG_LINES) % APP_LOG_LINES;
     for (int i = 0; i < n; i++) out[i] = a->logbuf[(start + i) % APP_LOG_LINES];
+    pthread_mutex_unlock(&m->log_mu);
     return n;
 }
 
-uint64_t app_log_serial(const svx_app *a) { return a->log_serial; }
+uint64_t app_log_serial(const svx_app *a) {
+    svx_app *m = (svx_app *)a;
+    pthread_mutex_lock(&m->log_mu);
+    uint64_t v = a->log_serial;
+    pthread_mutex_unlock(&m->log_mu);
+    return v;
+}
 
 void app_capture_log(svx_app *a) {
     /* Only a front end that owns the terminal calls this. Under the TUI a
@@ -545,6 +565,7 @@ void app_capture_log(svx_app *a) {
      * by the log pane instead. The headless front end does not call it and
      * keeps its plain stdout logging. */
     log_set_sink(app_log_sink, a);
+    a->log_captured = 1;
 }
 
 void app_set_observer(svx_app *a, void (*fn)(void *), void *user) {
@@ -598,6 +619,7 @@ svx_app *app_new(const svx_config *cfg, int no_tx) {
     a->out_muted = 0;
     a->volume_before_mute = cfg->output_volume_pct;
     snprintf(a->owner_kind, sizeof(a->owner_kind), "cli");
+    pthread_mutex_init(&a->log_mu, NULL);
 
     rc_callbacks cb = {
         .user            = a,
@@ -610,7 +632,7 @@ svx_app *app_new(const svx_config *cfg, int no_tx) {
         .on_error        = hl_error,
     };
     a->rc = rc_new(cfg, &cb);
-    if (!a->rc) { free(a); return NULL; }
+    if (!a->rc) { pthread_mutex_destroy(&a->log_mu); free(a); return NULL; }
 
     tgm_callbacks tcb = {
         .user        = a,
@@ -654,6 +676,11 @@ void app_free(svx_app *a) {
     if (a->rc) { rc_stop(a->rc, "quit"); rc_free(a->rc); }
     tx_close(a);
     audio_stop(a);
+    /* An abandoned connect worker may still be winding down and logging.
+     * Unhook our ring before freeing it; log_set_sink() waits out any call
+     * already inside it. */
+    if (a->log_captured) log_set_sink(NULL, NULL);
+    pthread_mutex_destroy(&a->log_mu);
     free(a);
 }
 
@@ -694,9 +721,13 @@ void app_service(svx_app *a, uint64_t now) {
     tgm_tick(&a->tgm, now_ms());
     tx_pump(a);
 
-    /* If the link went away mid-over, stop rather than encode into a void. */
-    if (a->tx_active && rc_get_state(a->rc) != RC_CONNECTED)
-        tx_stop(a, "the connection dropped");
+    /* If the link went away mid-over, stop rather than encode into a void —
+     * and say why, not just that it happened. */
+    if (a->tx_active && rc_get_state(a->rc) != RC_CONNECTED) {
+        char why[300];
+        snprintf(why, sizeof(why), "the connection dropped: %s", rc_last_error(a->rc));
+        tx_stop(a, why);
+    }
 
     /* Publish state for the panel widget. Self-throttling; catches connection,
      * talkgroup and PTT changes that reach here via rc_service and tx_pump. */
@@ -734,13 +765,20 @@ void app_tg_select(svx_app *a, uint32_t tg)  { tgm_select(&a->tgm, tg); }
 void app_tg_index(svx_app *a, int idx)       { tgm_select_index(&a->tgm, idx); }
 void app_toggle_lock(svx_app *a)             { tgm_toggle_lock(&a->tgm); }
 void app_toggle_mute(svx_app *a, uint32_t t) { tgm_toggle_mute(&a->tgm, t); }
-void app_reconnect(svx_app *a)               { rc_reconnect_now(a->rc); }
+void app_reconnect(svx_app *a) {
+    /* Stop TX first, so the log says what happened (not "the connection
+     * dropped") and the flush reaches the reflector before the link goes. */
+    if (a->tx_active) tx_stop(a, "reconnecting");
+    rc_reconnect_now(a->rc);
+}
+
 void app_quit(svx_app *a)                    { a->quit = 1; }
 int  app_should_quit(const svx_app *a)       { return a->quit; }
 
 void app_toggle_connect(svx_app *a) {
-    if (rc_get_state(a->rc) == RC_IDLE) rc_start(a->rc);
-    else                                rc_stop(a->rc, "disconnected by you");
+    if (rc_get_state(a->rc) == RC_IDLE) { rc_start(a->rc); return; }
+    if (a->tx_active) tx_stop(a, "disconnected by you");
+    rc_stop(a->rc, "disconnected by you");
 }
 
 void app_volume_delta(svx_app *a, int delta) {

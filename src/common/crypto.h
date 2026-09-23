@@ -28,6 +28,7 @@ typedef struct {
     uint16_t client_id;
     uint32_t tx_counter;
     int      sent_initial;
+    int      tx_exhausted;     /* counter 0xFFFFFFFF has been used */
 
     /* RX */
     uint8_t  rx_iv_rand[6];
@@ -50,14 +51,22 @@ void crypto_gen_tx_params(crypto_ctx_t *c, uint16_t client_id);
 void crypto_set_rx(crypto_ctx_t *c, const uint8_t iv_rand4[4], const uint8_t key[16]);
 
 /* The server sent an empty MsgStartUDPEncryption: it will use our TX key to
- * talk back to us. */
-void crypto_use_tx_for_rx(crypto_ctx_t *c);
+ * talk back to us. Returns -1, configuring nothing, when our client id is 0:
+ * the two directions' IVs differ only in the client-id bytes, so with id 0
+ * both ends would encrypt under the same key with the same nonces. */
+int  crypto_use_tx_for_rx(crypto_ctx_t *c);
 
 /* Encrypt `plaintext` into `out`. Returns the wire length, or -1.
- * `out` needs at least pt_len + 12 bytes (pt_len + 14 for the first packet). */
+ * `out` needs at least pt_len + 12 bytes (pt_len + 14 for the first packet).
+ * Also -1 once the 32-bit counter has been used up (crypto_tx_exhausted()):
+ * wrapping it would repeat a nonce under the same key. */
 ssize_t crypto_encrypt_wire(crypto_ctx_t *c,
                             const uint8_t *plaintext, size_t pt_len,
                             uint8_t *out, size_t out_cap);
+
+/* Every counter value has been used under this key; reconnect for a new one.
+ * (2^32 datagrams: years of continuous transmission on one connection.) */
+int crypto_tx_exhausted(const crypto_ctx_t *c);
 
 /* Decrypt a received datagram. Returns the plaintext length, or -1.
  *

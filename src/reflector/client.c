@@ -23,28 +23,77 @@
 #define RC_UDP_MTU     2048
 #define RC_MAX_MONITOR 64
 
+/* The reflector sends a TCP heartbeat after about 10 s without other traffic,
+ * so 30 s of silence is three missed beats: the path or the server is gone
+ * even if the kernel has not noticed yet (it would keep retransmitting into a
+ * dead NAT mapping for ~15 min). */
+#define RC_RX_TIMEOUT_MS 30000
+
+/* A MsgError this recent is taken to be the reason for the close that
+ * follows it. */
+#define RC_ERROR_REASON_MS 30000
+
+/* How long rc_free() gives an aborted worker to finish. Bounded: the worker
+ * may be stuck in name resolution, which cannot be interrupted. */
+#define RC_FREE_GRACE_MS 500
+
 /* Reconnect backoff, in seconds. The first two are short because the common
  * case is a brief network blip; after that we stop hammering the reflector. */
 static const int BACKOFF_S[] = { 3, 3, 5, 10, 20, 30, 60 };
 #define N_BACKOFF ((int)(sizeof(BACKOFF_S) / sizeof(BACKOFF_S[0])))
+
+/* One connect attempt, shared by the worker thread and the client.
+ *
+ * The client never waits for a worker. Stopping or restarting while one runs
+ * sets `abort` and lets go of the job; the worker notices within ~100 ms (or,
+ * inside name resolution, whenever that returns), releases whatever it built
+ * and frees the job when it drops the last reference. Joining it instead froze
+ * the caller — the GUI thread — for up to 15 s, or forever in SSL_connect.
+ *
+ * So that an abandoned worker depends on nothing the client owns, it works on
+ * its own copy of the configuration, and it only writes the client's wake pipe
+ * while `wake_fd` (guarded by `mu`) still names it. */
+typedef struct {
+    pthread_mutex_t  mu;
+    int              refs;            /* worker + client; guarded by mu      */
+    int              wake_fd;         /* -1 once the client let go; by mu    */
+    atomic_int       abort;
+    atomic_int       done;            /* result published (release/acquire)  */
+    int              claimed;         /* the client adopted the result       */
+    int              rc;
+    handshake_result result;
+    svx_config       cfg;
+} rc_job;
 
 struct rc_client {
     const svx_config *cfg;
     rc_callbacks      cb;
 
     rc_state          state;
-    char              last_error[256];
+    char              last_error[320];
 
     handshake_result  conn;          /* valid only while RC_CONNECTED */
     int               have_conn;
+    uint64_t          conn_since;    /* when it was adopted             */
+    uint64_t          last_tcp_rx;   /* last complete TCP frame         */
+    uint64_t          last_udp_rx;   /* last authenticated datagram     */
+    int               rx_timeout_ms; /* 0 disables the watchdog         */
+    int               rekey_needed;  /* the UDP counter ran out         */
+
+    /* The reflector's most recent MsgError, kept to explain a close. */
+    char              server_error[256];
+    uint64_t          server_error_at;
+
+    /* A connection dropped by rc_stop()/rc_reconnect_now(), which may run
+     * outside rc_service(). Its sockets stay open until the next rc_service()
+     * closes them: rc_client.h promises the descriptor set only changes inside
+     * the service call, and an embedding event loop (Qt) still has notifiers
+     * armed on them until then. */
+    handshake_result  closing;
+    int               have_closing;
 
     /* connect worker */
-    pthread_t         worker;
-    int               worker_running;
-    _Atomic int       worker_done;    /* worker sets (release); main reads (acquire) */
-    handshake_result  worker_result;
-    int               worker_rc;
-    volatile sig_atomic_t worker_abort;
+    rc_job           *job;           /* the attempt in flight, or NULL */
     int               wake_pipe[2];   /* worker -> main loop wakeup */
 
     /* timers */
@@ -85,6 +134,12 @@ static void set_state(rc_client *c, rc_state st, const char *detail) {
 
 /* ------------------------------------------------------------- lifetime */
 
+static void reset_result(handshake_result *r) {
+    memset(r, 0, sizeof(*r));
+    r->tcp_fd = r->udp_fd = -1;
+    r->tls.fd = -1;
+}
+
 rc_client *rc_new(const svx_config *cfg, const rc_callbacks *cb) {
     rc_client *c = calloc(1, sizeof(*c));
     if (!c) return NULL;
@@ -92,6 +147,7 @@ rc_client *rc_new(const svx_config *cfg, const rc_callbacks *cb) {
     c->cfg   = cfg;
     c->cb    = *cb;
     c->state = RC_IDLE;
+    c->rx_timeout_ms = RC_RX_TIMEOUT_MS;
 
     c->frame = malloc(RC_MAX_FRAME);
     if (!c->frame) { free(c); return NULL; }
@@ -100,35 +156,81 @@ rc_client *rc_new(const svx_config *cfg, const rc_callbacks *cb) {
     net_set_nonblock(c->wake_pipe[0]);
     net_set_nonblock(c->wake_pipe[1]);
 
-    c->conn.tcp_fd = c->conn.udp_fd = -1;
-    c->conn.tls.fd = -1;
+    reset_result(&c->conn);
+    reset_result(&c->closing);
     return c;
 }
 
-static void drop_connection(rc_client *c) {
-    if (!c->have_conn) return;
-    handshake_release(&c->conn);
-    memset(&c->conn, 0, sizeof(c->conn));
-    c->conn.tcp_fd = c->conn.udp_fd = -1;
-    c->conn.tls.fd = -1;
-    c->have_conn   = 0;
+static void wake(rc_client *c) {
+    ssize_t ignored = write(c->wake_pipe[1], "w", 1);
+    (void)ignored;
 }
 
-static void join_worker(rc_client *c) {
-    if (!c->worker_running) return;
-    c->worker_abort = 1;
-    pthread_join(c->worker, NULL);
-    c->worker_running = 0;
-    c->worker_abort   = 0;
-    /* If it succeeded while we were tearing down, release what it produced. */
-    if (c->worker_done && c->worker_rc == 0) handshake_release(&c->worker_result);
-    c->worker_done = 0;
+/* Close what a previous rc_stop()/rc_reconnect_now() set aside. Called from
+ * inside rc_service() only (and rc_free()). */
+static void close_deferred(rc_client *c) {
+    if (!c->have_closing) return;
+    handshake_release(&c->closing);
+    reset_result(&c->closing);
+    c->have_closing = 0;
+}
+
+/* Drop the current connection. Inside rc_service() its sockets close at once;
+ * from an action they are set aside for the next rc_service(), and the loop
+ * is woken so that happens promptly. */
+static void drop_connection(rc_client *c, int in_service) {
+    if (!c->have_conn) return;
+    if (in_service) {
+        handshake_release(&c->conn);
+    } else {
+        if (c->have_closing) handshake_release(&c->closing);   /* cannot happen: service ran in between */
+        c->closing      = c->conn;
+        c->have_closing = 1;
+        wake(c);
+    }
+    reset_result(&c->conn);
+    c->have_conn = 0;
+}
+
+/* Drop one reference to a job; the last one out frees it, and releases a
+ * successful result nobody adopted. */
+static void job_unref(rc_job *j) {
+    pthread_mutex_lock(&j->mu);
+    int last = (--j->refs == 0);
+    pthread_mutex_unlock(&j->mu);
+    if (!last) return;
+    if (j->rc == 0 && !j->claimed) handshake_release(&j->result);
+    pthread_mutex_destroy(&j->mu);
+    free(j);
+}
+
+/* Stop caring about the attempt in flight without waiting for it. */
+static void abandon_worker(rc_client *c) {
+    rc_job *j = c->job;
+    if (!j) return;
+    c->job = NULL;
+    atomic_store(&j->abort, 1);
+    pthread_mutex_lock(&j->mu);
+    j->wake_fd = -1;               /* from now on the worker leaves the client alone */
+    pthread_mutex_unlock(&j->mu);
+    job_unref(j);
 }
 
 void rc_free(rc_client *c) {
     if (!c) return;
-    join_worker(c);
-    drop_connection(c);
+    if (c->job) {
+        /* Give an aborted worker a moment to finish, so that it is not still
+         * inside OpenSSL while the process tears down — but a bounded one,
+         * and without joining: it may be stuck in DNS. */
+        rc_job *j = c->job;
+        atomic_store(&j->abort, 1);
+        uint64_t until = now_ms() + RC_FREE_GRACE_MS;
+        while (!atomic_load_explicit(&j->done, memory_order_acquire) && now_ms() < until)
+            msleep(10);
+        abandon_worker(c);
+    }
+    drop_connection(c, 1);
+    close_deferred(c);
     if (c->wake_pipe[0] >= 0) close(c->wake_pipe[0]);
     if (c->wake_pipe[1] >= 0) close(c->wake_pipe[1]);
     free(c->frame);
@@ -138,39 +240,55 @@ void rc_free(rc_client *c) {
 /* --------------------------------------------------------- the worker */
 
 static void *worker_main(void *arg) {
-    rc_client *c = arg;
-    c->worker_rc = handshake_run(c->cfg, &c->worker_result, &c->worker_abort);
+    rc_job *j = arg;
+    j->rc = handshake_run(&j->cfg, &j->result, &j->abort);
 
     /* Publish the result, then flag done with a RELEASE store, then wake the
-     * loop. The main thread reads worker_done with an acquire load before it
-     * has joined, so the release/acquire pair is what makes worker_rc and
-     * worker_result visible to it — the later pthread_join reaps the thread but
-     * is not what synchronises the data. (A plain int flag here is a data race
-     * TSan flags, even though the join makes the result itself safe.) */
-    atomic_store_explicit(&c->worker_done, 1, memory_order_release);
-    ssize_t ignored = write(c->wake_pipe[1], "c", 1);
-    (void)ignored;
+     * loop. The main thread reads `done` with an acquire load, which is what
+     * makes rc and result visible to it: nothing ever joins this thread. */
+    pthread_mutex_lock(&j->mu);
+    atomic_store_explicit(&j->done, 1, memory_order_release);
+    if (j->wake_fd >= 0) {
+        ssize_t ignored = write(j->wake_fd, "c", 1);
+        (void)ignored;
+    }
+    pthread_mutex_unlock(&j->mu);
+
+    job_unref(j);
     return NULL;
 }
 
 static void begin_connect(rc_client *c) {
-    if (c->worker_running) return;
+    if (c->job) return;
 
-    memset(&c->worker_result, 0, sizeof(c->worker_result));
-    c->worker_result.tcp_fd = c->worker_result.udp_fd = -1;
-    c->worker_result.tls.fd = -1;
-    c->worker_rc    = -1;
-    c->worker_done  = 0;
-    c->worker_abort = 0;
+    rc_job *j = calloc(1, sizeof(*j));
+    if (!j) goto fail;
+    pthread_mutex_init(&j->mu, NULL);
+    j->refs    = 2;
+    j->wake_fd = c->wake_pipe[1];
+    j->rc      = -1;
+    j->cfg     = *c->cfg;
+    reset_result(&j->result);
 
-    if (pthread_create(&c->worker, NULL, worker_main, c) != 0) {
-        snprintf(c->last_error, sizeof(c->last_error), "cannot start the connect thread");
-        set_state(c, RC_BACKOFF, c->last_error);
-        c->backoff_until = now_ms() + 5000;
-        return;
+    pthread_attr_t at;
+    pthread_attr_init(&at);
+    pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
+    pthread_t th;
+    int prc = pthread_create(&th, &at, worker_main, j);
+    pthread_attr_destroy(&at);
+    if (prc != 0) {
+        pthread_mutex_destroy(&j->mu);
+        free(j);
+        goto fail;
     }
-    c->worker_running = 1;
+    c->job = j;
     set_state(c, RC_CONNECTING, NULL);
+    return;
+
+fail:
+    snprintf(c->last_error, sizeof(c->last_error), "cannot start the connect thread");
+    set_state(c, RC_BACKOFF, c->last_error);
+    c->backoff_until = now_ms() + 5000;
 }
 
 void rc_start(rc_client *c) {
@@ -182,24 +300,26 @@ void rc_start(rc_client *c) {
 
 void rc_stop(rc_client *c, const char *reason) {
     c->user_stopped = 1;
-    join_worker(c);
-    drop_connection(c);
+    abandon_worker(c);
+    drop_connection(c, 0);
     snprintf(c->last_error, sizeof(c->last_error), "%s", reason ? reason : "disconnected");
     set_state(c, RC_IDLE, c->last_error);
 }
 
 void rc_reconnect_now(rc_client *c) {
     c->user_stopped = 0;
-    join_worker(c);
-    drop_connection(c);
+    abandon_worker(c);
+    drop_connection(c, 0);
     c->backoff_idx   = 0;
     c->backoff_until = 0;
     begin_connect(c);
 }
 
+void rc_set_rx_timeout(rc_client *c, int ms) { c->rx_timeout_ms = ms > 0 ? ms : 0; }
+
 /* Schedule the next attempt after losing (or failing to make) a connection. */
 static void enter_backoff(rc_client *c, const char *why) {
-    drop_connection(c);
+    drop_connection(c, 1);
     snprintf(c->last_error, sizeof(c->last_error), "%s", why ? why : "connection lost");
 
     if (c->user_stopped) { set_state(c, RC_IDLE, c->last_error); return; }
@@ -231,7 +351,12 @@ static int send_udp(rc_client *c, uint16_t type, const uint8_t *body, size_t bod
 
     uint8_t wire[RC_UDP_MTU + 32];
     ssize_t wn = crypto_encrypt_wire(&c->conn.crypto, pt, ptlen, wire, sizeof(wire));
-    if (wn < 0) return -1;
+    if (wn < 0) {
+        /* May be called from outside rc_service() (the TX path), so only flag
+         * it; rc_service() reconnects, which brings a fresh key. */
+        if (crypto_tx_exhausted(&c->conn.crypto)) c->rekey_needed = 1;
+        return -1;
+    }
 
     ssize_t sent = sendto(c->conn.udp_fd, wire, (size_t)wn, 0,
                           (struct sockaddr *)&c->conn.udp_remote,
@@ -346,6 +471,10 @@ static void handle_frame(rc_client *c, const uint8_t *body, size_t len) {
         char e[512];
         if (proto_parse_error(body, len, e, sizeof(e)) == 0) {
             log_warn("reflector: %s", e);
+            /* Usually the last thing before the reflector hangs up; keep it
+             * so the close can say why. */
+            snprintf(c->server_error, sizeof(c->server_error), "%s", e);
+            c->server_error_at = now_ms();
             if (c->cb.on_error) c->cb.on_error(c->cb.user, e);
         }
         break;
@@ -375,16 +504,60 @@ static void handle_frame(rc_client *c, const uint8_t *body, size_t len) {
     }
 }
 
+/* "4m51s" */
+static void fmt_span(char *dst, size_t cap, uint64_t ms) {
+    uint64_t s = ms / 1000;
+    if (s >= 3600)    snprintf(dst, cap, "%lluh%02llum", (unsigned long long)(s / 3600),
+                               (unsigned long long)(s % 3600 / 60));
+    else if (s >= 60) snprintf(dst, cap, "%llum%02llus", (unsigned long long)(s / 60),
+                               (unsigned long long)(s % 60));
+    else              snprintf(dst, cap, "%.1fs", (double)ms / 1000.0);
+}
+
+/* The control channel failed: say how, as precisely as the socket and the
+ * reflector let us, and schedule the reconnect. Every failure used to read
+ * "the reflector closed the connection", whether it was the server hanging
+ * up, a reset, a TLS alert or our own buffer limit — and the reflector's own
+ * reason, sent just before it closed, was thrown away. */
+static void connection_lost(rc_client *c) {
+    const tls_conn_t *t   = &c->conn.tls;
+    uint64_t          now = now_ms();
+
+    const char *what;
+    switch (t->close_kind) {
+    case TLS_CLOSE_NOTIFY:
+    case TLS_CLOSE_EOF:     what = "the reflector closed the connection"; break;
+    case TLS_CLOSE_RESET:   what = "the connection was reset";            break;
+    case TLS_CLOSE_NETWORK: what = "the connection failed";               break;
+    case TLS_CLOSE_ALERT:   what = "the TLS session failed";              break;
+    case TLS_CLOSE_LOCAL:   what = "dropped the connection";              break;
+    default:                what = "the connection was lost";             break;
+    }
+
+    char reason[300] = "";
+    if (c->server_error[0] && now - c->server_error_at <= RC_ERROR_REASON_MS)
+        snprintf(reason, sizeof(reason), ": %s", c->server_error);
+
+    char how[200], age[32], quiet[32];
+    tls_close_describe(t, how, sizeof(how));
+    fmt_span(age,   sizeof(age),   now - c->conn_since);
+    fmt_span(quiet, sizeof(quiet), now - c->last_tcp_rx);
+
+    char msg[sizeof(c->last_error)];
+    snprintf(msg, sizeof(msg), "%s%s (%s; after %s, last data %s ago)",
+             what, reason, how, age, quiet);
+    enter_backoff(c, msg);
+}
+
 static void pump_tcp(rc_client *c) {
     if (!c->have_conn) return;
 
-    if (tls_pump_in(&c->conn.tls) < 0) {
-        enter_backoff(c, "the reflector closed the connection");
-        return;
-    }
+    int r = tls_pump_in(&c->conn.tls);
 
-    /* Drain every complete frame we now hold. One TLS record can carry
-     * several, and poll() cannot see the ones already inside OpenSSL. */
+    /* Drain every complete frame we now hold — even when the read also found
+     * the connection closed: the reflector's parting MsgError arrives in the
+     * same breath as its close. One TLS record can carry several frames, and
+     * poll() cannot see the ones already inside OpenSSL. */
     for (;;) {
         size_t         have = 0;
         const uint8_t *p    = tls_peek(&c->conn.tls, &have);
@@ -399,10 +572,13 @@ static void pump_tcp(rc_client *c) {
 
         memcpy(c->frame, p + 4, L);
         tls_consume(&c->conn.tls, 4 + (size_t)L);
+        c->last_tcp_rx = now_ms();
 
         handle_frame(c, c->frame, L);
         if (!c->have_conn) return;   /* handle_frame may have torn us down */
     }
+
+    if (r < 0 || tls_failed(&c->conn.tls)) connection_lost(c);
 }
 
 /* ------------------------------------------------------- receive: UDP */
@@ -432,6 +608,7 @@ static void pump_udp(rc_client *c) {
 
         c->stats.rx_packets++;
         c->stats.rx_bytes += (uint64_t)n;
+        c->last_udp_rx = now_ms();
         if (gap > 0) c->stats.rx_lost += (uint64_t)gap;
 
         uint16_t       type = 0;
@@ -486,9 +663,15 @@ int rc_poll_fds(rc_client *c, struct pollfd *p, int max) {
 int rc_next_timeout_ms(rc_client *c, uint64_t now) {
     uint64_t next = now + 1000;      /* the 1 Hz statistics tick */
 
+    if (c->have_closing) return 0;   /* sockets waiting to be closed */
+
     if (c->state == RC_CONNECTED) {
         if (c->next_tcp_hb < next) next = c->next_tcp_hb;
         if (c->next_udp_hb < next) next = c->next_udp_hb;
+        if (c->rx_timeout_ms > 0) {
+            uint64_t dead = c->last_tcp_rx + (uint64_t)c->rx_timeout_ms;
+            if (dead < next) next = dead;
+        }
     } else if (c->state == RC_BACKOFF && c->backoff_until > 0) {
         if (c->backoff_until < next) next = c->backoff_until;
     }
@@ -499,15 +682,18 @@ int rc_next_timeout_ms(rc_client *c, uint64_t now) {
 
 /* ------------------------------------------------------------ service */
 
-static void adopt_connection(rc_client *c) {
-    c->conn      = c->worker_result;
+static void adopt_connection(rc_client *c, handshake_result *r) {
+    c->conn      = *r;
     c->have_conn = 1;
-    memset(&c->worker_result, 0, sizeof(c->worker_result));
+    reset_result(r);
 
     c->backoff_idx = 0;
     uint64_t now   = now_ms();
     c->next_tcp_hb = now + SVX_TCP_HEARTBEAT_MS;
     c->next_udp_hb = now + SVX_UDP_HEARTBEAT_MS;
+    c->conn_since  = c->last_tcp_rx = c->last_udp_rx = now;
+    c->rekey_needed    = 0;
+    c->server_error[0] = '\0';
 
     /* Restore the talkgroup state the user had before the drop, in the same
      * order the protocol requires: select first, monitor second. */
@@ -553,41 +739,60 @@ void rc_service(rc_client *c, uint64_t now) {
         while (read(c->wake_pipe[0], sink, sizeof(sink)) > 0) { }
     }
 
+    /* Sockets an action dropped since the last pass: close them now, where
+     * the embedding loop expects descriptors to change. */
+    close_deferred(c);
+
     /* Has the connect worker finished? Acquire, to pair with the worker's
      * release store and see everything it published. */
-    if (c->worker_running &&
-        atomic_load_explicit(&c->worker_done, memory_order_acquire)) {
-        pthread_join(c->worker, NULL);
-        c->worker_running = 0;
-        atomic_store_explicit(&c->worker_done, 0, memory_order_relaxed);
-
-        if (c->worker_rc == 0) {
-            adopt_connection(c);
+    rc_job *j = c->job;
+    if (j && atomic_load_explicit(&j->done, memory_order_acquire)) {
+        c->job = NULL;
+        if (j->rc == 0) {
+            j->claimed = 1;
+            adopt_connection(c, &j->result);
         } else {
-            enter_backoff(c, c->worker_result.err[0] ? c->worker_result.err
-                                                     : "connection failed");
+            enter_backoff(c, j->result.err[0] ? j->result.err : "connection failed");
         }
+        pthread_mutex_lock(&j->mu);
+        j->wake_fd = -1;
+        pthread_mutex_unlock(&j->mu);
+        job_unref(j);
     }
 
     if (c->state == RC_CONNECTED) {
         pump_tcp(c);
         if (c->have_conn) pump_udp(c);
 
-        if (c->have_conn) {
-            if (tls_flush(&c->conn.tls) != 0) {
-                enter_backoff(c, "the reflector closed the connection");
-            }
-        }
+        if (c->have_conn && tls_flush(&c->conn.tls) != 0) connection_lost(c);
 
         if (c->have_conn && now >= c->next_tcp_hb) {
             uint8_t buf[16];
             size_t  n;
             if (proto_build_heartbeat(buf, sizeof(buf), &n) == 0) {
-                if (send_frame(c, buf, n) != 0)
-                    enter_backoff(c, "the reflector stopped responding");
+                if (send_frame(c, buf, n) != 0) connection_lost(c);
             }
             c->next_tcp_hb = now + SVX_TCP_HEARTBEAT_MS;
         }
+
+        /* Receive watchdog. Sending proves nothing on a half-open connection:
+         * the kernel queues our heartbeats happily until TCP gives up, which
+         * takes about 15 minutes, while the UI says "connected" and no audio
+         * arrives. The reflector speaks at least every 10 s. */
+        if (c->have_conn && c->rx_timeout_ms > 0) {
+            uint64_t t = now_ms();
+            if (t - c->last_tcp_rx >= (uint64_t)c->rx_timeout_ms) {
+                char msg[160], age[32];
+                fmt_span(age, sizeof(age), t - c->conn_since);
+                snprintf(msg, sizeof(msg),
+                         "no data from the reflector for %d s (after %s) — assuming the link is dead",
+                         c->rx_timeout_ms / 1000, age);
+                enter_backoff(c, msg);
+            }
+        }
+
+        if (c->have_conn && c->rekey_needed)
+            enter_backoff(c, "the UDP key has been used up — reconnecting for a new one");
 
         if (c->have_conn && now >= c->next_udp_hb) {
             send_udp(c, UDP_MSG_HEARTBEAT, NULL, 0);

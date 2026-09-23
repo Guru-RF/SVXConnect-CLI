@@ -243,7 +243,10 @@ Full vocabulary in [docs/PTT.md](docs/PTT.md); service setup in
 
 ```sh
 make            # -> build/svxconnect
-make test       # talkgroup manager fixtures
+make test       # unit fixtures: talkgroups, crypto, config, status file, control FIFO
+make check      # the above, plus the client against a fake reflector (~25 s)
+make check-tsan # make check under ThreadSanitizer   (in build-tsan/)
+make check-asan # make check under ASan + UBSan      (in build-asan/)
 make asan       # AddressSanitizer + UndefinedBehaviorSanitizer build
 ```
 

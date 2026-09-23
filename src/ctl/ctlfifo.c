@@ -34,7 +34,7 @@ int ctl_open(ctl_fifo *c, const char *path, const ctl_callbacks *cb) {
     if (slash && slash != dir) { *slash = '\0'; mkdir_p(dir, 0755); }
 
     struct stat st;
-    if (stat(c->path, &st) == 0) {
+    if (lstat(c->path, &st) == 0) {
         if (!S_ISFIFO(st.st_mode)) {
             log_warn("ctl: %s exists and is not a FIFO — external control disabled",
                      c->path);
@@ -56,12 +56,32 @@ int ctl_open(ctl_fifo *c, const char *path, const ctl_callbacks *cb) {
      * A read-only FIFO reports EOF the moment the last writer closes, and
      * poll() then returns POLLIN forever with nothing to read — a busy loop
      * that pins a core. Holding a writer open ourselves means the pipe never
-     * reaches EOF and poll() stays quiet between commands. */
-    c->fd = open(c->path, O_RDWR | O_NONBLOCK);
+     * reaches EOF and poll() stays quiet between commands.
+     *
+     * O_NOFOLLOW: a symlink planted at the path is refused rather than
+     * followed to somebody else's FIFO. */
+    c->fd = open(c->path, O_RDWR | O_NONBLOCK | O_NOFOLLOW);
     if (c->fd < 0) {
         log_warn("ctl: cannot open %s: %s — external control disabled",
                  c->path, strerror(errno));
         c->path[0] = '\0';
+        c->created = 0;
+        return 0;
+    }
+
+    /* Whoever can write this FIFO can key the transmitter. A FIFO we did not
+     * create — at a configured shared path such as /tmp, say — may belong to
+     * another user or be open to everyone, so check what we actually opened:
+     * it must be ours, and nobody else may read or write it. */
+    if (fstat(c->fd, &st) != 0 || !S_ISFIFO(st.st_mode) ||
+        st.st_uid != geteuid() || (st.st_mode & 077) != 0) {
+        log_warn("ctl: %s is not a private FIFO owned by you (mode %03o) — "
+                 "external control disabled; remove it or chmod 600 it",
+                 c->path, (unsigned)(st.st_mode & 0777));
+        close(c->fd);
+        c->fd = -1;
+        c->path[0] = '\0';
+        c->created = 0;
         return 0;
     }
 

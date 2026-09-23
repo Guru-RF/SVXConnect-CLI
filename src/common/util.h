@@ -52,6 +52,12 @@ char *read_file(const char *path, size_t *len);
  * readable — this matters for private keys. */
 int write_file_atomic(const char *path, const void *data, size_t len, int mode);
 
+/* The same, without the fsync(). Readers still only ever see the old or the
+ * new contents, but after a crash the file may be empty or stale. For
+ * advisory files rewritten constantly from the main loop (the status file),
+ * where an fsync every second stalls audio and heartbeats behind disk I/O. */
+int write_file_replace(const char *path, const void *data, size_t len, int mode);
+
 /* mkdir -p */
 int mkdir_p(const char *path, int mode);
 

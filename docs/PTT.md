@@ -73,6 +73,12 @@ echo "ptt on"  > ~/.local/state/svxconnect/ctl
 echo "ptt off" > ~/.local/state/svxconnect/ctl
 ```
 
+Whoever can write to the FIFO can key your transmitter, so it must be yours
+and private: SVXConnect creates it with mode 600, and refuses a FIFO that is
+already there but belongs to someone else, lets others read or write it, or is
+a symlink — it logs why and runs without external control. Only matters if
+you point `ctl_fifo` somewhere shared such as `/tmp`.
+
 Full verb list:
 
 ```

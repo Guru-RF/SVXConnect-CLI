@@ -17,6 +17,14 @@
  *
  * rc_service() must be called every time round the loop even when poll()
  * returned nothing, because it also drives the timers.
+ *
+ * Descriptors are only ever opened or closed inside rc_service() (and
+ * rc_free()). rc_stop() and rc_reconnect_now() may be called from anywhere on
+ * the main thread — a button handler, say — and never block: they abandon a
+ * connect in progress rather than wait for it, and set the dropped
+ * connection's sockets aside, waking the loop through the wake pipe so the
+ * next rc_service() closes them. An event loop that arms notifiers from
+ * rc_poll_fds() after each rc_service() therefore never polls a closed fd.
  */
 #ifndef SVX_RC_CLIENT_H
 #define SVX_RC_CLIENT_H
@@ -62,7 +70,8 @@ typedef struct {
 
 typedef struct rc_client rc_client;
 
-/* `cfg` must outlive the client; it is not copied. */
+/* `cfg` must outlive the client; it is not copied (each connect attempt
+ * takes its own snapshot of it). */
 rc_client *rc_new(const svx_config *cfg, const rc_callbacks *cb);
 void       rc_free(rc_client *c);
 
@@ -74,6 +83,10 @@ void rc_stop(rc_client *c, const char *reason);
 
 /* Drop the current connection and reconnect immediately, resetting backoff. */
 void rc_reconnect_now(rc_client *c);
+
+/* Declare the connection dead after this long with nothing received on the
+ * control channel (default 30 s; 0 disables). Mainly for tests. */
+void rc_set_rx_timeout(rc_client *c, int ms);
 
 /* Fill `p` with the descriptors to poll. Returns how many were written. */
 int  rc_poll_fds(rc_client *c, struct pollfd *p, int max);

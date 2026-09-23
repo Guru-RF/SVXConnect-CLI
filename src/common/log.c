@@ -12,12 +12,35 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <pthread.h>
+#include <stdatomic.h>
 
-static int          g_level = LOG_INFO;
+/* Atomic: the connect worker reads it on every log call. */
+static atomic_int   g_level = LOG_INFO;
 static FILE        *g_file;
 static int          g_file_fd = -1;
 static log_sink_fn  g_sink;
 static void        *g_sink_user;
+
+/* The connect worker logs from its own thread while the main thread logs too,
+ * and a sink (the app's log ring, an embedding GUI's) is rarely safe to enter
+ * from two threads at once. One lock around the sink call serialises them,
+ * and because log_set_sink() takes it as well, a caller that swaps the sink
+ * out knows no thread is still inside the old one when it returns — so the
+ * owner of that sink can free it. Recursive, in case a sink itself logs. */
+static pthread_mutex_t g_lock;
+static pthread_once_t  g_lock_once = PTHREAD_ONCE_INIT;
+
+static void lock_init(void) {
+    pthread_mutexattr_t at;
+    pthread_mutexattr_init(&at);
+    pthread_mutexattr_settype(&at, PTHREAD_MUTEX_RECURSIVE);
+    pthread_mutex_init(&g_lock, &at);
+    pthread_mutexattr_destroy(&at);
+}
+
+static void log_lock(void)   { pthread_once(&g_lock_once, lock_init); pthread_mutex_lock(&g_lock); }
+static void log_unlock(void) { pthread_mutex_unlock(&g_lock); }
 
 static const char *const LEVEL_NAME[] = { "err ", "warn", "info", "dbg " };
 
@@ -58,19 +81,25 @@ int log_open_file(const char *path) {
     if (!f) { close(fd); return -1; }
     setvbuf(f, NULL, _IOLBF, 0);   /* line buffered: a crash keeps the tail */
 
-    log_close_file();
+    log_lock();
+    if (g_file) fclose(g_file);
     g_file    = f;
     g_file_fd = fd;
+    log_unlock();
     return fd;
 }
 
 void log_close_file(void) {
+    log_lock();
     if (g_file) { fclose(g_file); g_file = NULL; g_file_fd = -1; }
+    log_unlock();
 }
 
 void log_set_sink(log_sink_fn fn, void *user) {
+    log_lock();
     g_sink      = fn;
     g_sink_user = user;
+    log_unlock();
 }
 
 static void emit(int level, const char *fmt, va_list ap) {
@@ -79,20 +108,21 @@ static void emit(int level, const char *fmt, va_list ap) {
     char body[1024];
     vsnprintf(body, sizeof(body), fmt, ap);
 
-    if (g_sink) {
-        g_sink(level, body, g_sink_user);
-        return;
-    }
-
     char ts[32];
     time_t now = time(NULL);
     struct tm tm;
     localtime_r(&now, &tm);
     strftime(ts, sizeof(ts), "%H:%M:%S", &tm);
 
-    FILE *out = g_file ? g_file : stderr;
-    fprintf(out, "%s [%s] %s\n", ts, log_level_name(level), body);
-    if (!g_file) fflush(out);
+    log_lock();
+    if (g_sink) {
+        g_sink(level, body, g_sink_user);
+    } else {
+        FILE *out = g_file ? g_file : stderr;
+        fprintf(out, "%s [%s] %s\n", ts, log_level_name(level), body);
+        if (!g_file) fflush(out);
+    }
+    log_unlock();
 }
 
 #define LOG_FN(name, lvl)                        \
