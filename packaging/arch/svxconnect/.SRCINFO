@@ -1,6 +1,6 @@
 pkgbase = svxconnect
 	pkgdesc = Terminal client for SvxLink reflectors
-	pkgver = 0.1.1
+	pkgver = 0.1.3
 	pkgrel = 1
 	url = https://github.com/Guru-RF/SVXConnect-CLI
 	arch = x86_64
@@ -14,7 +14,7 @@ pkgbase = svxconnect
 	depends = ncurses
 	depends = alsa-lib
 	optdepends = libpulse: PulseAudio / pipewire-pulse audio backend
-	source = svxconnect-0.1.1.tar.gz::https://github.com/Guru-RF/SVXConnect-CLI/archive/refs/tags/v0.1.1.tar.gz
-	sha256sums = c956f7bad68998dcd5ecba6483dcecac6adb74e1ada6ce190598e2c20de06f04
+	source = svxconnect-0.1.3.tar.gz::https://github.com/Guru-RF/SVXConnect-CLI/archive/refs/tags/v0.1.3.tar.gz
+	sha256sums = c6823a7c3a3d08749b272e560d9cb6c3d0e0fce81d24d80b93f2d388edce5fbc
 
 pkgname = svxconnect
