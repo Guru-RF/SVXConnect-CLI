@@ -23,6 +23,16 @@
 #define RC_UDP_MTU     2048
 #define RC_MAX_MONITOR 64
 
+/* The reflector sends a TCP heartbeat after about 10 s without other traffic,
+ * so 30 s of silence is three missed beats: the path or the server is gone
+ * even if the kernel has not noticed yet (it would keep retransmitting into a
+ * dead NAT mapping for ~15 min). */
+#define RC_RX_TIMEOUT_MS 30000
+
+/* A MsgError this recent is taken to be the reason for the close that
+ * follows it. */
+#define RC_ERROR_REASON_MS 30000
+
 /* How long rc_free() gives an aborted worker to finish. Bounded: the worker
  * may be stuck in name resolution, which cannot be interrupted. */
 #define RC_FREE_GRACE_MS 500
@@ -60,10 +70,19 @@ struct rc_client {
     rc_callbacks      cb;
 
     rc_state          state;
-    char              last_error[256];
+    char              last_error[320];
 
     handshake_result  conn;          /* valid only while RC_CONNECTED */
     int               have_conn;
+    uint64_t          conn_since;    /* when it was adopted             */
+    uint64_t          last_tcp_rx;   /* last complete TCP frame         */
+    uint64_t          last_udp_rx;   /* last authenticated datagram     */
+    int               rx_timeout_ms; /* 0 disables the watchdog         */
+    int               rekey_needed;  /* the UDP counter ran out         */
+
+    /* The reflector's most recent MsgError, kept to explain a close. */
+    char              server_error[256];
+    uint64_t          server_error_at;
 
     /* A connection dropped by rc_stop()/rc_reconnect_now(), which may run
      * outside rc_service(). Its sockets stay open until the next rc_service()
@@ -128,6 +147,7 @@ rc_client *rc_new(const svx_config *cfg, const rc_callbacks *cb) {
     c->cfg   = cfg;
     c->cb    = *cb;
     c->state = RC_IDLE;
+    c->rx_timeout_ms = RC_RX_TIMEOUT_MS;
 
     c->frame = malloc(RC_MAX_FRAME);
     if (!c->frame) { free(c); return NULL; }
@@ -295,6 +315,8 @@ void rc_reconnect_now(rc_client *c) {
     begin_connect(c);
 }
 
+void rc_set_rx_timeout(rc_client *c, int ms) { c->rx_timeout_ms = ms > 0 ? ms : 0; }
+
 /* Schedule the next attempt after losing (or failing to make) a connection. */
 static void enter_backoff(rc_client *c, const char *why) {
     drop_connection(c, 1);
@@ -329,7 +351,12 @@ static int send_udp(rc_client *c, uint16_t type, const uint8_t *body, size_t bod
 
     uint8_t wire[RC_UDP_MTU + 32];
     ssize_t wn = crypto_encrypt_wire(&c->conn.crypto, pt, ptlen, wire, sizeof(wire));
-    if (wn < 0) return -1;
+    if (wn < 0) {
+        /* May be called from outside rc_service() (the TX path), so only flag
+         * it; rc_service() reconnects, which brings a fresh key. */
+        if (crypto_tx_exhausted(&c->conn.crypto)) c->rekey_needed = 1;
+        return -1;
+    }
 
     ssize_t sent = sendto(c->conn.udp_fd, wire, (size_t)wn, 0,
                           (struct sockaddr *)&c->conn.udp_remote,
@@ -444,6 +471,10 @@ static void handle_frame(rc_client *c, const uint8_t *body, size_t len) {
         char e[512];
         if (proto_parse_error(body, len, e, sizeof(e)) == 0) {
             log_warn("reflector: %s", e);
+            /* Usually the last thing before the reflector hangs up; keep it
+             * so the close can say why. */
+            snprintf(c->server_error, sizeof(c->server_error), "%s", e);
+            c->server_error_at = now_ms();
             if (c->cb.on_error) c->cb.on_error(c->cb.user, e);
         }
         break;
@@ -473,16 +504,60 @@ static void handle_frame(rc_client *c, const uint8_t *body, size_t len) {
     }
 }
 
+/* "4m51s" */
+static void fmt_span(char *dst, size_t cap, uint64_t ms) {
+    uint64_t s = ms / 1000;
+    if (s >= 3600)    snprintf(dst, cap, "%lluh%02llum", (unsigned long long)(s / 3600),
+                               (unsigned long long)(s % 3600 / 60));
+    else if (s >= 60) snprintf(dst, cap, "%llum%02llus", (unsigned long long)(s / 60),
+                               (unsigned long long)(s % 60));
+    else              snprintf(dst, cap, "%.1fs", (double)ms / 1000.0);
+}
+
+/* The control channel failed: say how, as precisely as the socket and the
+ * reflector let us, and schedule the reconnect. Every failure used to read
+ * "the reflector closed the connection", whether it was the server hanging
+ * up, a reset, a TLS alert or our own buffer limit — and the reflector's own
+ * reason, sent just before it closed, was thrown away. */
+static void connection_lost(rc_client *c) {
+    const tls_conn_t *t   = &c->conn.tls;
+    uint64_t          now = now_ms();
+
+    const char *what;
+    switch (t->close_kind) {
+    case TLS_CLOSE_NOTIFY:
+    case TLS_CLOSE_EOF:     what = "the reflector closed the connection"; break;
+    case TLS_CLOSE_RESET:   what = "the connection was reset";            break;
+    case TLS_CLOSE_NETWORK: what = "the connection failed";               break;
+    case TLS_CLOSE_ALERT:   what = "the TLS session failed";              break;
+    case TLS_CLOSE_LOCAL:   what = "dropped the connection";              break;
+    default:                what = "the connection was lost";             break;
+    }
+
+    char reason[300] = "";
+    if (c->server_error[0] && now - c->server_error_at <= RC_ERROR_REASON_MS)
+        snprintf(reason, sizeof(reason), ": %s", c->server_error);
+
+    char how[200], age[32], quiet[32];
+    tls_close_describe(t, how, sizeof(how));
+    fmt_span(age,   sizeof(age),   now - c->conn_since);
+    fmt_span(quiet, sizeof(quiet), now - c->last_tcp_rx);
+
+    char msg[sizeof(c->last_error)];
+    snprintf(msg, sizeof(msg), "%s%s (%s; after %s, last data %s ago)",
+             what, reason, how, age, quiet);
+    enter_backoff(c, msg);
+}
+
 static void pump_tcp(rc_client *c) {
     if (!c->have_conn) return;
 
-    if (tls_pump_in(&c->conn.tls) < 0) {
-        enter_backoff(c, "the reflector closed the connection");
-        return;
-    }
+    int r = tls_pump_in(&c->conn.tls);
 
-    /* Drain every complete frame we now hold. One TLS record can carry
-     * several, and poll() cannot see the ones already inside OpenSSL. */
+    /* Drain every complete frame we now hold — even when the read also found
+     * the connection closed: the reflector's parting MsgError arrives in the
+     * same breath as its close. One TLS record can carry several frames, and
+     * poll() cannot see the ones already inside OpenSSL. */
     for (;;) {
         size_t         have = 0;
         const uint8_t *p    = tls_peek(&c->conn.tls, &have);
@@ -497,10 +572,13 @@ static void pump_tcp(rc_client *c) {
 
         memcpy(c->frame, p + 4, L);
         tls_consume(&c->conn.tls, 4 + (size_t)L);
+        c->last_tcp_rx = now_ms();
 
         handle_frame(c, c->frame, L);
         if (!c->have_conn) return;   /* handle_frame may have torn us down */
     }
+
+    if (r < 0 || tls_failed(&c->conn.tls)) connection_lost(c);
 }
 
 /* ------------------------------------------------------- receive: UDP */
@@ -530,6 +608,7 @@ static void pump_udp(rc_client *c) {
 
         c->stats.rx_packets++;
         c->stats.rx_bytes += (uint64_t)n;
+        c->last_udp_rx = now_ms();
         if (gap > 0) c->stats.rx_lost += (uint64_t)gap;
 
         uint16_t       type = 0;
@@ -589,6 +668,10 @@ int rc_next_timeout_ms(rc_client *c, uint64_t now) {
     if (c->state == RC_CONNECTED) {
         if (c->next_tcp_hb < next) next = c->next_tcp_hb;
         if (c->next_udp_hb < next) next = c->next_udp_hb;
+        if (c->rx_timeout_ms > 0) {
+            uint64_t dead = c->last_tcp_rx + (uint64_t)c->rx_timeout_ms;
+            if (dead < next) next = dead;
+        }
     } else if (c->state == RC_BACKOFF && c->backoff_until > 0) {
         if (c->backoff_until < next) next = c->backoff_until;
     }
@@ -608,6 +691,9 @@ static void adopt_connection(rc_client *c, handshake_result *r) {
     uint64_t now   = now_ms();
     c->next_tcp_hb = now + SVX_TCP_HEARTBEAT_MS;
     c->next_udp_hb = now + SVX_UDP_HEARTBEAT_MS;
+    c->conn_since  = c->last_tcp_rx = c->last_udp_rx = now;
+    c->rekey_needed    = 0;
+    c->server_error[0] = '\0';
 
     /* Restore the talkgroup state the user had before the drop, in the same
      * order the protocol requires: select first, monitor second. */
@@ -678,18 +764,35 @@ void rc_service(rc_client *c, uint64_t now) {
         pump_tcp(c);
         if (c->have_conn) pump_udp(c);
 
-        if (c->have_conn && tls_flush(&c->conn.tls) != 0)
-            enter_backoff(c, "the reflector closed the connection");
+        if (c->have_conn && tls_flush(&c->conn.tls) != 0) connection_lost(c);
 
         if (c->have_conn && now >= c->next_tcp_hb) {
             uint8_t buf[16];
             size_t  n;
             if (proto_build_heartbeat(buf, sizeof(buf), &n) == 0) {
-                if (send_frame(c, buf, n) != 0)
-                    enter_backoff(c, "the reflector stopped responding");
+                if (send_frame(c, buf, n) != 0) connection_lost(c);
             }
             c->next_tcp_hb = now + SVX_TCP_HEARTBEAT_MS;
         }
+
+        /* Receive watchdog. Sending proves nothing on a half-open connection:
+         * the kernel queues our heartbeats happily until TCP gives up, which
+         * takes about 15 minutes, while the UI says "connected" and no audio
+         * arrives. The reflector speaks at least every 10 s. */
+        if (c->have_conn && c->rx_timeout_ms > 0) {
+            uint64_t t = now_ms();
+            if (t - c->last_tcp_rx >= (uint64_t)c->rx_timeout_ms) {
+                char msg[160], age[32];
+                fmt_span(age, sizeof(age), t - c->conn_since);
+                snprintf(msg, sizeof(msg),
+                         "no data from the reflector for %d s (after %s) — assuming the link is dead",
+                         c->rx_timeout_ms / 1000, age);
+                enter_backoff(c, msg);
+            }
+        }
+
+        if (c->have_conn && c->rekey_needed)
+            enter_backoff(c, "the UDP key has been used up — reconnecting for a new one");
 
         if (c->have_conn && now >= c->next_udp_hb) {
             send_udp(c, UDP_MSG_HEARTBEAT, NULL, 0);

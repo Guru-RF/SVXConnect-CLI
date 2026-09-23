@@ -84,6 +84,10 @@ void rc_stop(rc_client *c, const char *reason);
 /* Drop the current connection and reconnect immediately, resetting backoff. */
 void rc_reconnect_now(rc_client *c);
 
+/* Declare the connection dead after this long with nothing received on the
+ * control channel (default 30 s; 0 disables). Mainly for tests. */
+void rc_set_rx_timeout(rc_client *c, int ms);
+
 /* Fill `p` with the descriptors to poll. Returns how many were written. */
 int  rc_poll_fds(rc_client *c, struct pollfd *p, int max);
 
