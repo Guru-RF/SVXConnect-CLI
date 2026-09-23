@@ -23,10 +23,37 @@
 #define RC_UDP_MTU     2048
 #define RC_MAX_MONITOR 64
 
+/* How long rc_free() gives an aborted worker to finish. Bounded: the worker
+ * may be stuck in name resolution, which cannot be interrupted. */
+#define RC_FREE_GRACE_MS 500
+
 /* Reconnect backoff, in seconds. The first two are short because the common
  * case is a brief network blip; after that we stop hammering the reflector. */
 static const int BACKOFF_S[] = { 3, 3, 5, 10, 20, 30, 60 };
 #define N_BACKOFF ((int)(sizeof(BACKOFF_S) / sizeof(BACKOFF_S[0])))
+
+/* One connect attempt, shared by the worker thread and the client.
+ *
+ * The client never waits for a worker. Stopping or restarting while one runs
+ * sets `abort` and lets go of the job; the worker notices within ~100 ms (or,
+ * inside name resolution, whenever that returns), releases whatever it built
+ * and frees the job when it drops the last reference. Joining it instead froze
+ * the caller — the GUI thread — for up to 15 s, or forever in SSL_connect.
+ *
+ * So that an abandoned worker depends on nothing the client owns, it works on
+ * its own copy of the configuration, and it only writes the client's wake pipe
+ * while `wake_fd` (guarded by `mu`) still names it. */
+typedef struct {
+    pthread_mutex_t  mu;
+    int              refs;            /* worker + client; guarded by mu      */
+    int              wake_fd;         /* -1 once the client let go; by mu    */
+    atomic_int       abort;
+    atomic_int       done;            /* result published (release/acquire)  */
+    int              claimed;         /* the client adopted the result       */
+    int              rc;
+    handshake_result result;
+    svx_config       cfg;
+} rc_job;
 
 struct rc_client {
     const svx_config *cfg;
@@ -38,13 +65,16 @@ struct rc_client {
     handshake_result  conn;          /* valid only while RC_CONNECTED */
     int               have_conn;
 
+    /* A connection dropped by rc_stop()/rc_reconnect_now(), which may run
+     * outside rc_service(). Its sockets stay open until the next rc_service()
+     * closes them: rc_client.h promises the descriptor set only changes inside
+     * the service call, and an embedding event loop (Qt) still has notifiers
+     * armed on them until then. */
+    handshake_result  closing;
+    int               have_closing;
+
     /* connect worker */
-    pthread_t         worker;
-    int               worker_running;
-    _Atomic int       worker_done;    /* worker sets (release); main reads (acquire) */
-    handshake_result  worker_result;
-    int               worker_rc;
-    atomic_int        worker_abort;   /* main sets; the worker polls it */
+    rc_job           *job;           /* the attempt in flight, or NULL */
     int               wake_pipe[2];   /* worker -> main loop wakeup */
 
     /* timers */
@@ -85,6 +115,12 @@ static void set_state(rc_client *c, rc_state st, const char *detail) {
 
 /* ------------------------------------------------------------- lifetime */
 
+static void reset_result(handshake_result *r) {
+    memset(r, 0, sizeof(*r));
+    r->tcp_fd = r->udp_fd = -1;
+    r->tls.fd = -1;
+}
+
 rc_client *rc_new(const svx_config *cfg, const rc_callbacks *cb) {
     rc_client *c = calloc(1, sizeof(*c));
     if (!c) return NULL;
@@ -100,35 +136,81 @@ rc_client *rc_new(const svx_config *cfg, const rc_callbacks *cb) {
     net_set_nonblock(c->wake_pipe[0]);
     net_set_nonblock(c->wake_pipe[1]);
 
-    c->conn.tcp_fd = c->conn.udp_fd = -1;
-    c->conn.tls.fd = -1;
+    reset_result(&c->conn);
+    reset_result(&c->closing);
     return c;
 }
 
-static void drop_connection(rc_client *c) {
-    if (!c->have_conn) return;
-    handshake_release(&c->conn);
-    memset(&c->conn, 0, sizeof(c->conn));
-    c->conn.tcp_fd = c->conn.udp_fd = -1;
-    c->conn.tls.fd = -1;
-    c->have_conn   = 0;
+static void wake(rc_client *c) {
+    ssize_t ignored = write(c->wake_pipe[1], "w", 1);
+    (void)ignored;
 }
 
-static void join_worker(rc_client *c) {
-    if (!c->worker_running) return;
-    atomic_store(&c->worker_abort, 1);
-    pthread_join(c->worker, NULL);
-    c->worker_running = 0;
-    atomic_store(&c->worker_abort, 0);
-    /* If it succeeded while we were tearing down, release what it produced. */
-    if (c->worker_done && c->worker_rc == 0) handshake_release(&c->worker_result);
-    c->worker_done = 0;
+/* Close what a previous rc_stop()/rc_reconnect_now() set aside. Called from
+ * inside rc_service() only (and rc_free()). */
+static void close_deferred(rc_client *c) {
+    if (!c->have_closing) return;
+    handshake_release(&c->closing);
+    reset_result(&c->closing);
+    c->have_closing = 0;
+}
+
+/* Drop the current connection. Inside rc_service() its sockets close at once;
+ * from an action they are set aside for the next rc_service(), and the loop
+ * is woken so that happens promptly. */
+static void drop_connection(rc_client *c, int in_service) {
+    if (!c->have_conn) return;
+    if (in_service) {
+        handshake_release(&c->conn);
+    } else {
+        if (c->have_closing) handshake_release(&c->closing);   /* cannot happen: service ran in between */
+        c->closing      = c->conn;
+        c->have_closing = 1;
+        wake(c);
+    }
+    reset_result(&c->conn);
+    c->have_conn = 0;
+}
+
+/* Drop one reference to a job; the last one out frees it, and releases a
+ * successful result nobody adopted. */
+static void job_unref(rc_job *j) {
+    pthread_mutex_lock(&j->mu);
+    int last = (--j->refs == 0);
+    pthread_mutex_unlock(&j->mu);
+    if (!last) return;
+    if (j->rc == 0 && !j->claimed) handshake_release(&j->result);
+    pthread_mutex_destroy(&j->mu);
+    free(j);
+}
+
+/* Stop caring about the attempt in flight without waiting for it. */
+static void abandon_worker(rc_client *c) {
+    rc_job *j = c->job;
+    if (!j) return;
+    c->job = NULL;
+    atomic_store(&j->abort, 1);
+    pthread_mutex_lock(&j->mu);
+    j->wake_fd = -1;               /* from now on the worker leaves the client alone */
+    pthread_mutex_unlock(&j->mu);
+    job_unref(j);
 }
 
 void rc_free(rc_client *c) {
     if (!c) return;
-    join_worker(c);
-    drop_connection(c);
+    if (c->job) {
+        /* Give an aborted worker a moment to finish, so that it is not still
+         * inside OpenSSL while the process tears down — but a bounded one,
+         * and without joining: it may be stuck in DNS. */
+        rc_job *j = c->job;
+        atomic_store(&j->abort, 1);
+        uint64_t until = now_ms() + RC_FREE_GRACE_MS;
+        while (!atomic_load_explicit(&j->done, memory_order_acquire) && now_ms() < until)
+            msleep(10);
+        abandon_worker(c);
+    }
+    drop_connection(c, 1);
+    close_deferred(c);
     if (c->wake_pipe[0] >= 0) close(c->wake_pipe[0]);
     if (c->wake_pipe[1] >= 0) close(c->wake_pipe[1]);
     free(c->frame);
@@ -138,39 +220,55 @@ void rc_free(rc_client *c) {
 /* --------------------------------------------------------- the worker */
 
 static void *worker_main(void *arg) {
-    rc_client *c = arg;
-    c->worker_rc = handshake_run(c->cfg, &c->worker_result, &c->worker_abort);
+    rc_job *j = arg;
+    j->rc = handshake_run(&j->cfg, &j->result, &j->abort);
 
     /* Publish the result, then flag done with a RELEASE store, then wake the
-     * loop. The main thread reads worker_done with an acquire load before it
-     * has joined, so the release/acquire pair is what makes worker_rc and
-     * worker_result visible to it — the later pthread_join reaps the thread but
-     * is not what synchronises the data. (A plain int flag here is a data race
-     * TSan flags, even though the join makes the result itself safe.) */
-    atomic_store_explicit(&c->worker_done, 1, memory_order_release);
-    ssize_t ignored = write(c->wake_pipe[1], "c", 1);
-    (void)ignored;
+     * loop. The main thread reads `done` with an acquire load, which is what
+     * makes rc and result visible to it: nothing ever joins this thread. */
+    pthread_mutex_lock(&j->mu);
+    atomic_store_explicit(&j->done, 1, memory_order_release);
+    if (j->wake_fd >= 0) {
+        ssize_t ignored = write(j->wake_fd, "c", 1);
+        (void)ignored;
+    }
+    pthread_mutex_unlock(&j->mu);
+
+    job_unref(j);
     return NULL;
 }
 
 static void begin_connect(rc_client *c) {
-    if (c->worker_running) return;
+    if (c->job) return;
 
-    memset(&c->worker_result, 0, sizeof(c->worker_result));
-    c->worker_result.tcp_fd = c->worker_result.udp_fd = -1;
-    c->worker_result.tls.fd = -1;
-    c->worker_rc    = -1;
-    c->worker_done  = 0;
-    atomic_store(&c->worker_abort, 0);
+    rc_job *j = calloc(1, sizeof(*j));
+    if (!j) goto fail;
+    pthread_mutex_init(&j->mu, NULL);
+    j->refs    = 2;
+    j->wake_fd = c->wake_pipe[1];
+    j->rc      = -1;
+    j->cfg     = *c->cfg;
+    reset_result(&j->result);
 
-    if (pthread_create(&c->worker, NULL, worker_main, c) != 0) {
-        snprintf(c->last_error, sizeof(c->last_error), "cannot start the connect thread");
-        set_state(c, RC_BACKOFF, c->last_error);
-        c->backoff_until = now_ms() + 5000;
-        return;
+    pthread_attr_t at;
+    pthread_attr_init(&at);
+    pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
+    pthread_t th;
+    int prc = pthread_create(&th, &at, worker_main, j);
+    pthread_attr_destroy(&at);
+    if (prc != 0) {
+        pthread_mutex_destroy(&j->mu);
+        free(j);
+        goto fail;
     }
-    c->worker_running = 1;
+    c->job = j;
     set_state(c, RC_CONNECTING, NULL);
+    return;
+
+fail:
+    snprintf(c->last_error, sizeof(c->last_error), "cannot start the connect thread");
+    set_state(c, RC_BACKOFF, c->last_error);
+    c->backoff_until = now_ms() + 5000;
 }
 
 void rc_start(rc_client *c) {
@@ -182,16 +280,16 @@ void rc_start(rc_client *c) {
 
 void rc_stop(rc_client *c, const char *reason) {
     c->user_stopped = 1;
-    join_worker(c);
-    drop_connection(c);
+    abandon_worker(c);
+    drop_connection(c, 0);
     snprintf(c->last_error, sizeof(c->last_error), "%s", reason ? reason : "disconnected");
     set_state(c, RC_IDLE, c->last_error);
 }
 
 void rc_reconnect_now(rc_client *c) {
     c->user_stopped = 0;
-    join_worker(c);
-    drop_connection(c);
+    abandon_worker(c);
+    drop_connection(c, 0);
     c->backoff_idx   = 0;
     c->backoff_until = 0;
     begin_connect(c);
@@ -199,7 +297,7 @@ void rc_reconnect_now(rc_client *c) {
 
 /* Schedule the next attempt after losing (or failing to make) a connection. */
 static void enter_backoff(rc_client *c, const char *why) {
-    drop_connection(c);
+    drop_connection(c, 1);
     snprintf(c->last_error, sizeof(c->last_error), "%s", why ? why : "connection lost");
 
     if (c->user_stopped) { set_state(c, RC_IDLE, c->last_error); return; }
@@ -486,6 +584,8 @@ int rc_poll_fds(rc_client *c, struct pollfd *p, int max) {
 int rc_next_timeout_ms(rc_client *c, uint64_t now) {
     uint64_t next = now + 1000;      /* the 1 Hz statistics tick */
 
+    if (c->have_closing) return 0;   /* sockets waiting to be closed */
+
     if (c->state == RC_CONNECTED) {
         if (c->next_tcp_hb < next) next = c->next_tcp_hb;
         if (c->next_udp_hb < next) next = c->next_udp_hb;
@@ -499,10 +599,10 @@ int rc_next_timeout_ms(rc_client *c, uint64_t now) {
 
 /* ------------------------------------------------------------ service */
 
-static void adopt_connection(rc_client *c) {
-    c->conn      = c->worker_result;
+static void adopt_connection(rc_client *c, handshake_result *r) {
+    c->conn      = *r;
     c->have_conn = 1;
-    memset(&c->worker_result, 0, sizeof(c->worker_result));
+    reset_result(r);
 
     c->backoff_idx = 0;
     uint64_t now   = now_ms();
@@ -553,31 +653,33 @@ void rc_service(rc_client *c, uint64_t now) {
         while (read(c->wake_pipe[0], sink, sizeof(sink)) > 0) { }
     }
 
+    /* Sockets an action dropped since the last pass: close them now, where
+     * the embedding loop expects descriptors to change. */
+    close_deferred(c);
+
     /* Has the connect worker finished? Acquire, to pair with the worker's
      * release store and see everything it published. */
-    if (c->worker_running &&
-        atomic_load_explicit(&c->worker_done, memory_order_acquire)) {
-        pthread_join(c->worker, NULL);
-        c->worker_running = 0;
-        atomic_store_explicit(&c->worker_done, 0, memory_order_relaxed);
-
-        if (c->worker_rc == 0) {
-            adopt_connection(c);
+    rc_job *j = c->job;
+    if (j && atomic_load_explicit(&j->done, memory_order_acquire)) {
+        c->job = NULL;
+        if (j->rc == 0) {
+            j->claimed = 1;
+            adopt_connection(c, &j->result);
         } else {
-            enter_backoff(c, c->worker_result.err[0] ? c->worker_result.err
-                                                     : "connection failed");
+            enter_backoff(c, j->result.err[0] ? j->result.err : "connection failed");
         }
+        pthread_mutex_lock(&j->mu);
+        j->wake_fd = -1;
+        pthread_mutex_unlock(&j->mu);
+        job_unref(j);
     }
 
     if (c->state == RC_CONNECTED) {
         pump_tcp(c);
         if (c->have_conn) pump_udp(c);
 
-        if (c->have_conn) {
-            if (tls_flush(&c->conn.tls) != 0) {
-                enter_backoff(c, "the reflector closed the connection");
-            }
-        }
+        if (c->have_conn && tls_flush(&c->conn.tls) != 0)
+            enter_backoff(c, "the reflector closed the connection");
 
         if (c->have_conn && now >= c->next_tcp_hb) {
             uint8_t buf[16];
