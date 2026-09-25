@@ -1,7 +1,7 @@
 # Maintainer: Joeri Van Dooren <ure@on6ure.be>
 
 pkgname=svxconnect
-pkgver=0.1.3
+pkgver=0.1.4
 pkgrel=1
 pkgdesc='Terminal client for SvxLink reflectors'
 arch=('x86_64' 'aarch64')
@@ -14,7 +14,7 @@ depends=('glibc' 'openssl' 'opus' 'ncurses' 'alsa-lib')
 makedepends=('pkgconf')
 optdepends=('libpulse: PulseAudio / pipewire-pulse audio backend')
 source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
-sha256sums=('c6823a7c3a3d08749b272e560d9cb6c3d0e0fce81d24d80b93f2d388edce5fbc')
+sha256sums=('4ff88eac5f9f255c1e8d28f2ccf18d7068f1f59ce7a164d6164afdb810015a1f')
 
 _srcdir="SVXConnect-CLI-$pkgver"
 
