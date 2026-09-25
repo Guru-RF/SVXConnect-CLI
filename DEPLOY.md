@@ -76,9 +76,11 @@ sudo -u svxconnect svxconnect --enroll -c /etc/svxconnect/be.conf
 ```
 
 It retries every 30 s and is safe to interrupt; the key and CSR stay on disk and
-are reused, so running it again continues where it left off. Only once
-`/var/lib/svxconnect/pki/<CALLSIGN>.crt` exists will the service be able to
-connect.
+are reused, so running it again continues where it left off. Enrolment is done
+when it prints `enrolled.` (or, run again later, `the reflector accepts it`) —
+not merely when `/var/lib/svxconnect/pki/<CALLSIGN>.crt` exists: a certificate
+the reflector has refused stays on disk while its replacement waits for the
+sysop.
 
 ## Install the unit
 
@@ -141,6 +143,13 @@ certificate. Check whether the same callsign is running elsewhere.
 
 **`no certificate for <CALL>`.** Enrolment has not completed. Run `--enroll`
 again as the service user and wait for the sysop.
+
+**`the reflector refused our certificate`.** It looks valid here, but the
+reflector turns it away — revoked or removed on its side, or one of the two
+clocks is wrong. The service requests a new one with the same key by itself and
+logs in once the sysop has signed it. To do the same by hand, stop the service
+and run `--enroll` as the service user: it checks the certificate with the
+reflector and, when it is refused, requests the replacement and waits for it.
 
 **Nothing in the journal.** Confirm `log_file` is empty in the config; a
 configured log file takes the output away from stdout and therefore away from

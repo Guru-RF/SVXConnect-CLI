@@ -16,6 +16,9 @@ It shares one identity with
 the same configuration file, the same client certificate and a shared run lock.
 Only one of the two may hold the reflector connection at a time; the other
 refuses to start and names the process in the way.
+.B \-\-enroll
+takes the same lock whenever it logs in to check an existing certificate, and
+leaves the check to the connected client when another one holds it.
 .SH OPTIONS
 .TP
 .B \-c \fIfile\fR, \fB\-\-config \fIfile\fR
@@ -44,9 +47,27 @@ replace an existing file, keeping the old one as
 .IR file .bak.
 .TP
 .B \-\-enroll
-Generate a key and certificate request and send it to the reflector sysop for
-signing. Run this once, before first use, after
+Get the client certificate signed, or check the one you have.
+.RS
+.IP \(bu 2
+With no certificate yet, generate a key and a certificate request, send it to
+the reflector and wait for its sysop to sign it. Run this once, before first
+use, after
 .BR \-\-init\-config .
+It retries every 30 seconds and is safe to interrupt.
+.IP \(bu 2
+With a certificate that is valid here, log in with it and ask the reflector.
+If it accepts it, say so. If it refuses it \(em revoked or removed on the
+reflector, or the two clocks disagree \(em request a new one with the same key
+and wait for it to be signed. If the reflector cannot be reached, say that it
+could not be checked.
+.IP \(bu 2
+With an expired certificate, request a new one with the same key.
+.RE
+.IP
+Exit status: 0 when a certificate is in place (signed, accepted, or valid here
+and not checkable), 1 when interrupted before that or when the reflector turned
+the login away, 2 on an error.
 .TP
 .B \-\-headless
 Run with no interface, logging events to standard output. This is what the

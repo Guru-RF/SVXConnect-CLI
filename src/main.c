@@ -100,7 +100,9 @@ static int require_enrolled(const svx_config *cfg) {
 /* Take the shared run lock before owning the reflector connection. Only one
  * client — this CLI (TUI or headless) or the desktop GUI — may be connected at
  * once, so if the lock is held we name the holder and refuse rather than fight
- * over the same certificate and node id. Returns 0 when acquired. */
+ * over the same certificate and node id. --enroll takes it too, but only for
+ * the moment it logs in to check a certificate (see enroll.c). Returns 0 when
+ * acquired. */
 static int acquire_run_lock(const svx_config *cfg, const char *kind) {
     int r = svx_lock_acquire(cfg->lock_file, kind);
     if (r == 0) return 0;
@@ -394,7 +396,8 @@ static void usage(FILE *f) {
 "      --init-config     write a fully commented configuration, asking for your\n"
 "                        callsign, email and reflector; --set fills in any key\n"
 "      --force           with --init-config: replace an existing file (kept as .bak)\n"
-"      --enroll          generate a CSR and wait for the sysop to sign it\n"
+"      --enroll          get a certificate signed, or check the one you have with\n"
+"                        the reflector and replace it if it refuses it\n"
 "      --list-devices    list audio input and output devices, then exit\n"
 "      --audio-test      loop the microphone back to the speaker, then exit\n"
 "      --dump-config     print every setting with its resolved value\n"

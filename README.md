@@ -12,7 +12,7 @@ terminal window.
 > **Status: working, and on the air.** The reflector client, certificate
 > enrolment, audio both ways, the talkgroup manager and the ncurses interface
 > are all done and verified against a live reflector — including a full
-> transmit/receive round-trip through a parrot talkgroup. `make check` runs 341
+> transmit/receive round-trip through a parrot talkgroup. `make check` runs 380
 > checks — the unit fixtures, plus the client, the audio core and certificate
 > renewal against a fake reflector on loopback — and passes clean under
 > AddressSanitizer, UndefinedBehaviorSanitizer and ThreadSanitizer.
@@ -76,7 +76,7 @@ Every [release](https://github.com/Guru-RF/SVXConnect-CLI/releases) carries a
 ready-built package that pacman installs straight from the URL:
 
 ```sh
-sudo pacman -U https://github.com/Guru-RF/SVXConnect-CLI/releases/download/v0.1.1/svxconnect-0.1.1-1-x86_64.pkg.tar.zst
+sudo pacman -U https://github.com/Guru-RF/SVXConnect-CLI/releases/download/v0.1.4/svxconnect-0.1.4-1-x86_64.pkg.tar.zst
 ```
 
 Or build it yourself from the PKGBUILDs in
@@ -215,7 +215,7 @@ See [docs/TCC.md](docs/TCC.md).
 
 All milestones complete and verified against the live `be.svx.link` reflector,
 including a transmit/receive round-trip through the parrot talkgroup. `make
-check` runs 341 checks: talkgroup preemption, crypto/replay, the
+check` runs 380 checks: talkgroup preemption, crypto/replay, the
 `--init-config` renderer, the status file and control FIFO, the audio
 watchdog, certificate renewal, and the connection layer against a fake
 reflector.
