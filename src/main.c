@@ -27,7 +27,7 @@
 #include <unistd.h>
 #include <getopt.h>
 
-#define SVX_VERSION "0.1.3"
+#define SVX_VERSION "0.1.4"
 
 /* example.conf, embedded at build time by the Makefile's example_conf.inc
  * rule, so --init-config needs no data file at a path that differs between

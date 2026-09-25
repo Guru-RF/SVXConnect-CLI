@@ -1,3 +1,16 @@
+svxconnect (0.1.4-1) unstable; urgency=medium
+
+  * --enroll checks a certificate that looks valid with the reflector:
+    accepted, it says so; refused (revoked or removed on the reflector, or
+    the clocks disagree), it requests a new one with the same key; no
+    answer, it says it could not check. It takes the shared run lock before
+    logging in, and leaves the check to another client that holds it.
+  * A replacement for a refused certificate is no longer held to the refused
+    one's expiry date, in --enroll and in the running client.
+  * --enroll reports a MsgError from the reflector as such (exit status 1).
+
+ -- Joeri Van Dooren <ure@on6ure.be>  Fri, 25 Sep 2026 14:35:47 +0200
+
 svxconnect (0.1.3-1) unstable; urgency=medium
 
   * A microphone or speaker whose stream starts but never runs is detected
