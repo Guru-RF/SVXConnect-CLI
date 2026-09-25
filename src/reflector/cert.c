@@ -57,7 +57,8 @@ void cert_assess(const svx_config *cfg, time_t now, cert_state *out, int log) {
 }
 
 pki_push_result cert_handle_push(const svx_config *cfg,
-                                 const uint8_t *body, size_t len, time_t now) {
+                                 const uint8_t *body, size_t len, time_t now,
+                                 const char *refused_fp) {
     char cert_path[1024], key_path[1024];
     pki_build_path(cert_path, sizeof(cert_path), cfg->pki_dir, cfg->callsign, "crt");
     pki_build_path(key_path,  sizeof(key_path),  cfg->pki_dir, cfg->callsign, "key");
@@ -70,8 +71,8 @@ pki_push_result cert_handle_push(const svx_config *cfg,
     pki_cert_info_t info;
     char            why[320];
     pki_push_result r = pki_store_pushed_cert(cert_path, key_path, cfg->callsign,
-                                              pem, pem_len, now, &info,
-                                              why, sizeof(why));
+                                              pem, pem_len, now, refused_fp,
+                                              &info, why, sizeof(why));
     free(pem);
 
     char na[32];

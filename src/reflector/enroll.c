@@ -5,6 +5,7 @@
 #include "cert.h"
 #include "frameio.h"
 
+#include "common/lock.h"
 #include "common/log.h"
 #include "common/net.h"
 #include "common/pki.h"
@@ -31,9 +32,31 @@ static atomic_int g_stop;
 
 static void on_signal(int sig) { (void)sig; g_stop = 1; }
 
-/* One connect-and-ask cycle.
- * Returns 0 when the certificate arrived, 1 to try again later, -1 fatal. */
-static int attempt(const svx_config *cfg, int *out_sent_csr) {
+/* What one attempt learned, beyond its return value. */
+typedef struct {
+    int  sent_csr;          /* our request reached the reflector                 */
+    int  authenticated;     /* it accepted the certificate we presented          */
+    int  stored;            /* it sent a certificate, and we stored it           */
+    char refused_fp[65];    /* the certificate it turned away in TLS, if any     */
+    char server_error[256]; /* its MsgError text, if it sent one                 */
+} attempt_result;
+
+/* Fingerprint of the certificate on disk, or "" when there is none. */
+static void disk_fingerprint(const svx_config *cfg, char out[65]) {
+    cert_state cs;
+    cert_assess(cfg, time(NULL), &cs, 0);
+    snprintf(out, 65, "%s", cs.status == PKI_CERT_MISSING ? "" : cs.info.fingerprint);
+}
+
+/* One connect-and-ask cycle. A usable certificate on disk is offered unless it
+ * is the one named by `refused_fp` — the reflector turned that one away, so it
+ * is left out and the session goes the no-certificate way, which is what makes
+ * the reflector ask for a request. Keyed on the certificate rather than a
+ * flag: a certificate that appears on disk while this waits (the service, or
+ * the user copying in one the sysop sent) is a different one, and is offered.
+ * Returns 0 when a certificate arrived or the one we have was accepted, 1 to
+ * try again later, -1 fatal. */
+static int attempt(const svx_config *cfg, const char *refused_fp, attempt_result *res) {
     int         rc      = 1;
     int         fd      = -1;
     SSL_CTX    *ssl_ctx = NULL;
@@ -124,12 +147,26 @@ static int attempt(const svx_config *cfg, int *out_sent_csr) {
              * one, which is exactly why it will ask for a CSR next. An expired
              * certificate is left out too: the reflector would refuse it in
              * the TLS handshake instead of asking for a new request. */
-            int have_cert = (enroll_have_usable_cert(cfg, time(NULL)) == 1);
+            char on_disk[65];
+            disk_fingerprint(cfg, on_disk);
+            int have_cert = (enroll_have_usable_cert(cfg, time(NULL)) == 1) &&
+                            !(refused_fp[0] && strcmp(on_disk, refused_fp) == 0);
             ssl_ctx = tls_make_ctx(ca_path,
                                    have_cert ? cert_path : NULL,
                                    have_cert ? key_path  : NULL);
             if (!ssl_ctx) { rc = -1; goto done; }
-            if (tls_start(&tls, ssl_ctx, fd) != 0) goto done;
+            if (tls_start(&tls, ssl_ctx, fd) != 0) {
+                /* A certificate alert against the certificate we offered is
+                 * an answer, not a network problem: the reflector will not
+                 * have this certificate, however valid it looks here. */
+                if (have_cert && tls_cert_rejected(&tls)) {
+                    char why[200];
+                    tls_close_describe(&tls, why, sizeof(why));
+                    log_dbg("certificate refused in the TLS handshake: %s", why);
+                    snprintf(res->refused_fp, sizeof(res->refused_fp), "%s", on_disk);
+                }
+                goto done;
+            }
             log_dbg("TLS established");
             break;
         }
@@ -151,7 +188,7 @@ static int attempt(const svx_config *cfg, int *out_sent_csr) {
             if (!ok) { rc = -1; goto done; }
             if (fio_send(&tls, fd, buf, blen) != 0) goto done;
 
-            *out_sent_csr = 1;
+            res->sent_csr = 1;
             log_info("request sent for %s <%s>", cfg->callsign, cfg->email);
             break;
         }
@@ -160,23 +197,36 @@ static int attempt(const svx_config *cfg, int *out_sent_csr) {
             /* Checked before it is written: a certificate for another
              * callsign or key, or an expired one, would replace a file that
              * may still work with one that certainly does not. */
-            switch (cert_handle_push(cfg, buf, (size_t)L, time(NULL))) {
+            switch (cert_handle_push(cfg, buf, (size_t)L, time(NULL), refused_fp)) {
             case PKI_PUSH_STORED:
+                res->stored = 1;
                 rc = 0;
                 break;
             case PKI_PUSH_EMPTY:
                 rc = 1;                  /* not signed yet: try again later */
                 break;
-            case PKI_PUSH_SAME:
-                /* The reflector considers the certificate we have current.
-                 * If it is expired here, the clocks disagree, and asking
-                 * again will not change that. */
+            case PKI_PUSH_SAME: {
+                /* The reflector sent the certificate that is on disk now. If
+                 * that is not the one it refused, someone else stored the new
+                 * one while this waited (the connected client, or the user):
+                 * the job is done. If it IS the refused one, or an expired one,
+                 * the two clocks disagree, and asking again will not help. */
+                char on_disk[65];
+                disk_fingerprint(cfg, on_disk);
+                if (enroll_have_usable_cert(cfg, time(NULL)) == 1 &&
+                    !(refused_fp[0] && strcmp(on_disk, refused_fp) == 0)) {
+                    log_info("the new certificate is already in %s", cert_path);
+                    res->stored = 1;
+                    rc = 0;
+                    break;
+                }
                 log_err("the reflector still considers the certificate in %s valid; "
                         "check the date and time on this computer, or ask the sysop "
                         "to remove and re-sign the certificate for %s",
                         cert_path, cfg->callsign);
                 rc = -1;
                 break;
+            }
             case PKI_PUSH_REJECTED:
             case PKI_PUSH_WRITE_FAILED:
                 rc = -1;
@@ -190,7 +240,7 @@ static int attempt(const svx_config *cfg, int *out_sent_csr) {
              * NOT success, and treating it as such is the classic bug here.
              * Answer so we are not dropped, then let the loop time out and
              * retry later. */
-            if (*out_sent_csr) {
+            if (res->sent_csr) {
                 log_info("request delivered, waiting for the sysop to sign it");
             }
             {
@@ -205,8 +255,7 @@ static int attempt(const svx_config *cfg, int *out_sent_csr) {
             /* We authenticated, so a valid signed certificate is already on
              * disk and being used. Nothing left to enrol. */
             if (enroll_have_usable_cert(cfg, time(NULL)) == 1) {
-                log_info("%s already has a valid certificate in %s",
-                         cfg->callsign, cfg->pki_dir);
+                res->authenticated = 1;
                 rc = 0;
                 goto done;
             }
@@ -214,8 +263,13 @@ static int attempt(const svx_config *cfg, int *out_sent_csr) {
 
         case MSG_ERROR: {
             char e[512];
-            if (proto_parse_error(buf, (size_t)L, e, sizeof(e)) == 0)
+            if (proto_parse_error(buf, (size_t)L, e, sizeof(e)) == 0) {
                 log_err("reflector: %s", e);
+                snprintf(res->server_error, sizeof(res->server_error), "%s", e);
+            } else {
+                snprintf(res->server_error, sizeof(res->server_error),
+                         "an error it did not explain");
+            }
             goto done;
         }
 
@@ -248,7 +302,37 @@ int enroll_have_usable_cert(const svx_config *cfg, time_t now) {
     return pki_check_pair(cs.cert_path, cs.key_path) == 0 ? 1 : 0;
 }
 
+/* Take the shared run lock for the probe, which logs in with our certificate:
+ * a second login with the same certificate can knock the connected client off
+ * the air. Returns 1 when it is ours (or locking is off), 0 when another
+ * SVXConnect holds it — having said who. */
+static int take_run_lock(const svx_config *cfg) {
+    if (!cfg->lock_file[0]) return 1;
+    int r = svx_lock_acquire(cfg->lock_file, "enroll");
+    if (r == 0) return 1;
+    if (r == -2) {
+        log_warn("cannot create the run lock %s; checking anyway", cfg->lock_file);
+        return 1;
+    }
+    char who[32] = "";
+    long pid = 0;
+    svx_lock_who(cfg->lock_file, who, sizeof(who), &pid);
+    log_info("SVXConnect (%s, pid %ld) is connected with this certificate. It checks the "
+             "certificate on every login and requests a new one by itself if the "
+             "reflector refuses it; stop it first to check from --enroll.",
+             who[0] ? who : "another client", pid);
+    return 0;
+}
+
+static int enroll_run_locked(const svx_config *cfg, int retry_seconds);
+
 int enroll_run(const svx_config *cfg, int retry_seconds) {
+    int rc = enroll_run_locked(cfg, retry_seconds);
+    svx_lock_release();          /* idempotent; only drops it if we took it */
+    return rc;
+}
+
+static int enroll_run_locked(const svx_config *cfg, int retry_seconds) {
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
     sa.sa_handler = on_signal;
@@ -266,20 +350,66 @@ int enroll_run(const svx_config *cfg, int retry_seconds) {
     pki_format_time(cs.info.not_after, na, sizeof(na));
     int days = pki_days_until(cs.info.not_after, time(NULL));
 
+    /* A certificate that looks valid here is only half the answer: the
+     * reflector may have revoked or removed it, or its clock may disagree
+     * with ours. The file cannot say which, so ask the reflector — the one
+     * party that knows. Up to 0.1.3 --enroll asked nobody and reported
+     * "nothing to do" for a certificate the reflector turned away on every
+     * login. */
+    char refused_fp[65] = "";
     if (enroll_have_usable_cert(cfg, time(NULL)) == 1) {
-        log_info("%s already has a certificate, valid until %s (%d days)",
-                 cfg->callsign, na, days);
-        if (cs.status == PKI_CERT_OK) {
-            log_info("the reflector renews it by itself from the day it is 2/3 "
-                     "through its lifetime; nothing to do");
-        } else if (cs.status == PKI_CERT_RENEW_DUE || cs.status == PKI_CERT_EXPIRING) {
-            log_info("renewal is due. The reflector sends the renewed certificate "
-                     "to svxconnect once it has been connected for ten minutes — "
-                     "run svxconnect and leave it connected.");
+        log_info("%s already has a certificate, valid until %s (%d days); "
+                 "checking it with %s", cfg->callsign, na, days, cfg->reflector);
+
+        if (!take_run_lock(cfg)) return 0;
+
+        attempt_result probe;
+        memset(&probe, 0, sizeof(probe));
+        int prc = attempt(cfg, "", &probe);
+
+        if (probe.authenticated) {
+            log_info("the reflector accepts it");
+            if (cs.status == PKI_CERT_OK) {
+                log_info("the reflector renews it by itself from the day it is 2/3 "
+                         "through its lifetime; nothing to do");
+            } else if (cs.status == PKI_CERT_RENEW_DUE || cs.status == PKI_CERT_EXPIRING) {
+                log_info("renewal is due. The reflector sends the renewed certificate "
+                         "to svxconnect once it has been connected for ten minutes — "
+                         "run svxconnect and leave it connected.");
+            }
+            return 0;
         }
-        return 0;
-    }
-    if (cs.status == PKI_CERT_EXPIRED) {
+        if (probe.stored) {
+            /* It answered the login with a renewal; cert_handle_push has
+             * already said what was stored. */
+            log_info("the reflector sent a renewed certificate, which is now in place");
+            return 0;
+        }
+        if (probe.server_error[0]) {
+            log_warn("%s turned the login away (%s) without saying whether it accepts "
+                     "the certificate. If another SVXConnect with this callsign is "
+                     "connected somewhere, that is the usual reason.",
+                     cfg->reflector, probe.server_error);
+            return 1;
+        }
+        if (!probe.refused_fp[0]) {
+            if (prc < 0) return -1;
+            if (g_stop)  return 1;
+            /* No answer. The file is fine as far as anyone can tell, so this
+             * is not an error — but it is not a check either, and the log must
+             * not pretend otherwise. */
+            log_warn("could not check the certificate with %s; it is valid here "
+                     "until %s. Run --enroll again when the reflector is reachable "
+                     "to confirm that it is accepted.", cfg->reflector, na);
+            return 0;
+        }
+
+        log_warn("the reflector REFUSED the certificate for %s, although it is valid "
+                 "here until %s. It may have been revoked or removed on the reflector, "
+                 "or one of the two clocks is wrong. Requesting a new one with the "
+                 "same key.", cfg->callsign, na);
+        snprintf(refused_fp, sizeof(refused_fp), "%s", probe.refused_fp);
+    } else if (cs.status == PKI_CERT_EXPIRED) {
         log_warn("the certificate for %s EXPIRED on %s — requesting a new one "
                  "with the same key", cfg->callsign, na);
     }
@@ -289,18 +419,19 @@ int enroll_run(const svx_config *cfg, int retry_seconds) {
              "minutes or days.");
     log_info("it is safe to stop with Ctrl-C and run --enroll again later.");
 
-    int sent_csr = 0;
-    int tries    = 0;
+    attempt_result res;
+    memset(&res, 0, sizeof(res));
+    int tries = 0;
 
     while (!g_stop) {
         tries++;
-        int rc = attempt(cfg, &sent_csr);
+        int rc = attempt(cfg, refused_fp, &res);
         if (rc == 0) {
             char cn[64] = "", exp[32] = "";
-            int  days = 0;
-            pki_cert_info(cs.cert_path, cn, sizeof(cn), exp, sizeof(exp), &days);
+            int  d = 0;
+            pki_cert_info(cs.cert_path, cn, sizeof(cn), exp, sizeof(exp), &d);
             log_info("enrolled. %s is valid until %s (%d days).",
-                     cn[0] ? cn : cfg->callsign, exp, days);
+                     cn[0] ? cn : cfg->callsign, exp, d);
             log_info("you can now run: svxconnect");
             return 0;
         }

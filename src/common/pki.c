@@ -435,6 +435,7 @@ void pki_format_time(time_t t, char *out, size_t cap) {
 pki_push_result pki_store_pushed_cert(const char *cert_path, const char *key_path,
                                       const char *callsign,
                                       const char *pem, size_t len, time_t now,
+                                      const char *refused_fp,
                                       pki_cert_info_t *out,
                                       char *why, size_t why_cap) {
     pki_cert_info_t info;
@@ -491,7 +492,9 @@ pki_push_result pki_store_pushed_cert(const char *cert_path, const char *key_pat
         snprintf(why, why_cap, "it expired on %s — check this machine's clock", na);
         return PKI_PUSH_REJECTED;
     }
-    if (have_cur && out->not_after < cur.not_after) {
+    const int cur_refused = have_cur && refused_fp && refused_fp[0] &&
+                            strcmp(cur.fingerprint, refused_fp) == 0;
+    if (have_cur && !cur_refused && out->not_after < cur.not_after) {
         char cna[32];
         pki_format_time(cur.not_after, cna, sizeof(cna));
         snprintf(why, why_cap, "it expires on %s, before the one we have (%s)", na, cna);

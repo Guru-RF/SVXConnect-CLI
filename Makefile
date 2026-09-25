@@ -260,6 +260,7 @@ CERT_TEST_OBJ := $(BUILD)/tests/certtest.o \
                  $(BUILD)/src/reflector/nodeinfo.o \
                  $(BUILD)/src/common/config.o \
                  $(BUILD)/src/common/crypto.o \
+                 $(BUILD)/src/common/lock.o \
                  $(BUILD)/src/common/log.o \
                  $(BUILD)/src/common/net.o \
                  $(BUILD)/src/common/pki.o \

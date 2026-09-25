@@ -521,7 +521,7 @@ static void handle_frame(rc_client *c, const uint8_t *body, size_t len) {
          * everything else on that session afterwards. So reconnect whatever
          * the outcome: straight away with a new certificate, through the
          * normal backoff otherwise. */
-        pki_push_result r = cert_handle_push(c->cfg, body, len, time(NULL));
+        pki_push_result r = cert_handle_push(c->cfg, body, len, time(NULL), NULL);
         if (r == PKI_PUSH_STORED) {
             log_info("reconnecting to log in with the renewed certificate");
             rc_reconnect_now(c);

@@ -116,11 +116,20 @@ typedef enum {
  * belong to the private key at `key_path`, not be expired, and not expire
  * sooner than the certificate already on disk. Anything less leaves the file
  * alone, because the certificate we have may still work and the one offered
- * certainly will not. `why` receives a one-line reason for anything but
- * PKI_PUSH_STORED; `out` (may be NULL) the details of the offered certificate. */
+ * certainly will not.
+ *
+ * `refused_fp` (may be NULL or "") is the fingerprint of a certificate the
+ * reflector has turned away. When that is the one on disk, it is no yardstick:
+ * it does not work at all, so a replacement is not held to its expiry date. A
+ * reflector whose clock was set back re-signs with an earlier date, and the
+ * renewal rule would otherwise throw away the only certificate that works.
+ *
+ * `why` receives a one-line reason for anything but PKI_PUSH_STORED; `out`
+ * (may be NULL) the details of the offered certificate. */
 pki_push_result pki_store_pushed_cert(const char *cert_path, const char *key_path,
                                       const char *callsign,
                                       const char *pem, size_t len, time_t now,
+                                      const char *refused_fp,
                                       pki_cert_info_t *out,
                                       char *why, size_t why_cap);
 

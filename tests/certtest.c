@@ -31,6 +31,8 @@
 #include <stdarg.h>
 #include <stdatomic.h>
 #include <stdio.h>
+#include <fcntl.h>
+#include <sys/file.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -255,6 +257,9 @@ static void fresh_dir(void) {
     put_file(g_key_path, g_key_pem);
     chmod(g_key_path, 0600);
     snprintf(g_cfg.pki_dir, sizeof(g_cfg.pki_dir), "%s", g_dir);
+    /* The run lock too: --enroll takes it before it logs in, and a real
+     * SVXConnect running on this machine must not change what a test sees. */
+    snprintf(g_cfg.lock_file, sizeof(g_cfg.lock_file), "%s/run.lock", g_dir);
 }
 
 static void rm_dir(void) {
@@ -368,7 +373,7 @@ static void t_banner(void) {
 
 static pki_push_result push(const char *pem, time_t now, char *why, size_t cap) {
     return pki_store_pushed_cert(g_crt, g_key_path, CALL, pem, pem ? strlen(pem) : 0,
-                                 now, NULL, why, cap);
+                                 now, NULL, NULL, why, cap);
 }
 
 static int tmp_left(void) {
@@ -497,6 +502,15 @@ typedef struct {
     char       *push_pem;      /* push this once, after a login with a certificate */
     char        refuse_fp[65]; /* turn this certificate away in the TLS handshake,
                                   with a certificate_revoked alert */
+    int         refuse_once;   /* ...only the first time: a client that keeps
+                                  offering it then logs in, and a test sees that
+                                  by name instead of timing out */
+    int         drop_after_starttls; /* hang up where TLS should begin: a TLS
+                                  failure that is NOT about the certificate */
+    const char *login_error;   /* answer a login with this MsgError, not AuthOk */
+    const char *store_signed_to; /* write the certificate it signs here before
+                                  sending it, as a second client storing the
+                                  same renewal first would */
 
     /* what it saw; read by the test after fr_stop() or under mu */
     pthread_mutex_t mu;
@@ -591,7 +605,8 @@ static int accept_any(int ok, X509_STORE_CTX *c) {
     int refuse = 0;
     pthread_mutex_lock(&f->mu);
     snprintf(f->presented[f->cur], 65, "%s", fp);
-    if (f->refuse_fp[0] && strcmp(fp, f->refuse_fp) == 0) { refuse = 1; f->refused++; }
+    if (f->refuse_fp[0] && strcmp(fp, f->refuse_fp) == 0 &&
+        !(f->refuse_once && f->refused > 0)) { refuse = 1; f->refused++; }
     pthread_mutex_unlock(&f->mu);
     if (!refuse) return 1;
     X509_STORE_CTX_set_error(c, X509_V_ERR_CERT_REVOKED);
@@ -618,6 +633,7 @@ static void serve(fakerefl *f, int fd) {
     free(ca_pem);
     if (rd_frame(NULL, fd, buf, 65536, &L, NULL) != 14) goto out;         /* StartEncReq */
     wr_frame(NULL, fd, 15, NULL);
+    if (f->drop_after_starttls) goto out;
 
     ssl = SSL_new(f->ctx);
     SSL_set_fd(ssl, fd);
@@ -645,6 +661,7 @@ static void serve(fakerefl *f, int fd) {
         pthread_mutex_unlock(&f->mu);
         if (f->sign_csr) {
             char *pem = sign_csr_pem(f->csr, f->sign_pub_key);
+            if (f->store_signed_to && pem) put_file(f->store_signed_to, pem);
             wr_frame(ssl, fd, 18, pem);
             free(pem);
             /* ...and then ignore the session, like the reflector. */
@@ -654,6 +671,10 @@ static void serve(fakerefl *f, int fd) {
     }
     X509_free(peer);
 
+    if (f->login_error) {                                                  /* MsgError */
+        wr_frame(ssl, fd, 13, f->login_error);
+        goto out;
+    }
     wr_frame(ssl, fd, 12, NULL);                                           /* AuthOk */
     wr_server_info(ssl);
     int t;
@@ -1020,9 +1041,265 @@ static void t_enroll_wrong_cert(void) {
     rm_dir();
 }
 
+/* The three answers --enroll can now get about a certificate that looks
+ * valid here: accepted, refused, or no answer at all. Before 0.1.4 it asked
+ * nobody and reported "nothing to do" in all three. */
+
+static void fingerprint_of_file(const char *path, char out[65]) {
+    FILE *fp = fopen(path, "r");
+    X509 *x  = fp ? PEM_read_X509(fp, NULL, NULL, NULL) : NULL;
+    if (fp) fclose(fp);
+    out[0] = '\0';
+    if (x) { fingerprint_into(x, out); X509_free(x); }
+}
+
+static void t_enroll_valid_accepted(void) {
+    printf("cert: --enroll asks the reflector about a valid certificate, and it is accepted\n");
+    fresh_dir();
+    char *old = install_cert(-10 * DAY, 80 * DAY);
+    char  fp[65];
+    fingerprint_of_file(g_crt, fp);
+
+    fakerefl f;
+    fr_start(&f);
+    f.sign_csr = 1;                   /* would sign, if it were ever asked */
+    fr_run(&f);
+
+    log_reset();
+    int rc = enroll_run(&g_cfg, 1);
+    fr_stop(&f);
+
+    CHECK(rc == 0, "enrolment reports success (rc %d)", rc);
+    CHECK(f.sessions == 1, "after exactly one visit to the reflector (%d)", f.sessions);
+    CHECK(strcmp(f.presented[0], fp) == 0, "where it presented the certificate");
+    CHECK(f.got_csr == 0, "and asked for nothing");
+    CHECK(same_file(g_crt, old), "the certificate is unchanged");
+    CHECK(log_has("the reflector accepts it") && !log_has("could not check") &&
+          !log_has("REFUSED"), "and the log says the reflector accepted it, and nothing else");
+    free(old);
+    rm_dir();
+}
+
+static void t_enroll_valid_refused(void) {
+    printf("cert: --enroll replaces a valid-looking certificate the reflector refuses\n");
+    fresh_dir();
+    char *old = install_cert(-10 * DAY, 80 * DAY);
+    char  fp[65];
+    fingerprint_of_file(g_crt, fp);
+
+    fakerefl f;
+    fr_start(&f);
+    f.sign_csr    = 1;
+    f.refuse_once = 1;      /* offered again, it would log in: see below */
+    snprintf(f.refuse_fp, sizeof(f.refuse_fp), "%s", fp);
+    fr_run(&f);
+
+    log_reset();
+    int rc = enroll_run(&g_cfg, 1);
+    fr_stop(&f);
+
+    CHECK(rc == 0, "enrolment succeeds (rc %d)", rc);
+    CHECK(f.refused == 1, "the refused certificate was offered once, to find out (%d)", f.refused);
+    CHECK(f.logins == 0, "and never again: offered twice, it would have logged in");
+    CHECK(f.sessions >= 2 && f.presented[1][0] == '\0',
+          "and not again: the next session went without it");
+    CHECK(f.got_csr == 1, "a request was sent");
+    CHECK(!same_file(g_crt, old), "the certificate was replaced");
+    CHECK(same_file(g_key_path, g_key_pem), "the key was kept");
+    CHECK(enroll_have_usable_cert(&g_cfg, time(NULL)) == 1, "and the new one is usable");
+    CHECK(log_has("REFUSED") && log_has("same key"),
+          "the log says the reflector refused it, and what happens next");
+    free(old);
+    rm_dir();
+}
+
+static void t_enroll_valid_unreachable(void) {
+    printf("cert: --enroll says so when it cannot check a valid certificate\n");
+    fresh_dir();
+    char *old = install_cert(-10 * DAY, 80 * DAY);
+
+    /* A port with nothing listening: take one from the kernel and close it. */
+    fakerefl f;
+    fr_start(&f);
+    close(f.lfd);
+    f.lfd = -1;
+    SSL_CTX_free(f.ctx);
+    pthread_mutex_destroy(&f.mu);
+
+    log_reset();
+    int rc = enroll_run(&g_cfg, 1);
+
+    CHECK(rc == 0, "a certificate that is valid here is not an error (rc %d)", rc);
+    CHECK(log_has("could not check"), "but the log does not pretend it was checked");
+    CHECK(same_file(g_crt, old), "and nothing on disk changed");
+    free(old);
+    rm_dir();
+}
+
+static void t_enroll_valid_tls_failure(void) {
+    printf("cert: --enroll does not take a TLS failure for a refusal\n");
+    fresh_dir();
+    char *old = install_cert(-10 * DAY, 80 * DAY);
+
+    fakerefl f;
+    fr_start(&f);
+    f.sign_csr            = 1;
+    f.drop_after_starttls = 1;
+    fr_run(&f);
+
+    log_reset();
+    int rc = enroll_run(&g_cfg, 1);
+    fr_stop(&f);
+
+    CHECK(rc == 0, "the certificate stays, and that is not an error (rc %d)", rc);
+    CHECK(f.sessions == 1 && f.got_csr == 0, "no request was sent over a dropped link");
+    CHECK(same_file(g_crt, old), "the certificate is unchanged");
+    CHECK(log_has("could not check") && !log_has("REFUSED"),
+          "and the log says it could not check, not that it was refused");
+    free(old);
+    rm_dir();
+}
+
+static void t_enroll_refused_shorter_replacement(void) {
+    printf("cert: a replacement for a refused certificate may expire sooner than it\n");
+    fresh_dir();
+    /* Longer-lived than anything the fake signs (90 days): the renewal rule
+     * "never expires sooner than the one we have" would throw the only
+     * working certificate away. A reflector whose clock was set back does
+     * exactly this. */
+    char *old = install_cert(-10 * DAY, 200 * DAY);
+    char  fp[65];
+    fingerprint_of_file(g_crt, fp);
+
+    fakerefl f;
+    fr_start(&f);
+    f.sign_csr = 1;
+    snprintf(f.refuse_fp, sizeof(f.refuse_fp), "%s", fp);
+    fr_run(&f);
+
+    log_reset();
+    int rc = enroll_run(&g_cfg, 1);
+    fr_stop(&f);
+
+    CHECK(rc == 0, "enrolment succeeds (rc %d)", rc);
+    CHECK(!same_file(g_crt, old), "the shorter-lived replacement was stored");
+    CHECK(!log_has("before the one we have"), "not held to the refused one's expiry");
+    free(old);
+    rm_dir();
+}
+
+static void t_handshake_refused_shorter_replacement(void) {
+    printf("cert: the running client also stores a shorter replacement for a refused certificate\n");
+    fresh_dir();
+    char *old = install_cert(-10 * DAY, 200 * DAY);
+    char  fp[65];
+    fingerprint_of_file(g_crt, fp);
+
+    fakerefl f;
+    fr_start(&f);
+    f.sign_csr = 1;
+    snprintf(f.refuse_fp, sizeof(f.refuse_fp), "%s", fp);
+    fr_run(&f);
+
+    handshake_result r;
+    log_reset();
+    handshake_run_ex(&g_cfg, &r, NULL, fp);    /* told it was refused */
+    fr_stop(&f);
+
+    CHECK(r.cert_renewed, "the login stores the new certificate (%s)", r.err);
+    CHECK(!same_file(g_crt, old), "the file was replaced");
+    free(old);
+    rm_dir();
+}
+
+static void t_enroll_refused_other_client_stored(void) {
+    printf("cert: --enroll finishes when another client stored the new certificate first\n");
+    fresh_dir();
+    char *old = install_cert(-10 * DAY, 80 * DAY);
+    char  fp[65];
+    fingerprint_of_file(g_crt, fp);
+
+    fakerefl f;
+    fr_start(&f);
+    f.sign_csr        = 1;
+    f.store_signed_to = g_crt;          /* the service got there first */
+    snprintf(f.refuse_fp, sizeof(f.refuse_fp), "%s", fp);
+    fr_run(&f);
+
+    log_reset();
+    int rc = enroll_run(&g_cfg, 1);
+    fr_stop(&f);
+
+    CHECK(rc == 0, "that is success, not a clock problem (rc %d)", rc);
+    CHECK(!same_file(g_crt, old), "the new certificate is in place");
+    CHECK(!log_has("still considers"), "and no false warning about the clocks");
+    free(old);
+    rm_dir();
+}
+
+static void t_enroll_probe_server_error(void) {
+    printf("cert: --enroll reports a login the reflector turns away, not \"unreachable\"\n");
+    fresh_dir();
+    char *old = install_cert(-10 * DAY, 80 * DAY);
+
+    fakerefl f;
+    fr_start(&f);
+    f.login_error = "Access denied";
+    fr_run(&f);
+
+    log_reset();
+    int rc = enroll_run(&g_cfg, 1);
+    fr_stop(&f);
+
+    CHECK(rc == 1, "not confirmed, so not 0 (rc %d)", rc);
+    CHECK(log_has("turned the login away") && log_has("Access denied"),
+          "the log says the reflector answered, and what it said");
+    CHECK(!log_has("could not check"), "without claiming it was unreachable");
+    CHECK(f.got_csr == 0 && same_file(g_crt, old), "and nothing was requested or changed");
+    free(old);
+    rm_dir();
+}
+
+static void t_enroll_lock_held(void) {
+    printf("cert: --enroll does not log in beside a connected client\n");
+    fresh_dir();
+    char *old = install_cert(-10 * DAY, 80 * DAY);
+
+    /* Another SVXConnect holds the run lock: an flock on its own open file,
+     * which is exactly what svx_lock_acquire in another process leaves. */
+    int lfd = open(g_cfg.lock_file, O_RDWR | O_CREAT, 0644);
+    int locked = (lfd >= 0 && flock(lfd, LOCK_EX | LOCK_NB) == 0);
+    if (lfd >= 0) { ssize_t w = write(lfd, "pid=4242 kind=gui\n", 18); (void)w; }
+
+    fakerefl f;
+    fr_start(&f);
+    f.sign_csr = 1;
+    fr_run(&f);
+
+    log_reset();
+    int rc = enroll_run(&g_cfg, 1);
+    fr_stop(&f);
+    if (lfd >= 0) close(lfd);
+
+    CHECK(locked, "(the test holds the lock)");
+    CHECK(rc == 0, "the certificate stays in use (rc %d)", rc);
+    CHECK(f.sessions == 0, "and --enroll did not log in beside it (%d)", f.sessions);
+    CHECK(log_has("pid 4242") && log_has("stop it first"),
+          "the log names the client in the way, and what to do");
+    CHECK(same_file(g_crt, old), "nothing changed");
+    free(old);
+    rm_dir();
+}
+
 /* ------------------------------------------------------------------ main */
 
 int main(void) {
+    /* Line-buffered: a test that times out ends the run with _exit, which does
+     * not flush, and piped output would lose every result before it. */
+    setvbuf(stdout, NULL, _IOLBF, 0);
+    /* As svxconnect's main() does: a reflector that hangs up mid-handshake
+     * must be an error return, not a signal that ends the process. */
+    signal(SIGPIPE, SIG_IGN);
     g_verbose = getenv("CERTTEST_VERBOSE") != NULL;
     signal(SIGALRM, on_test_timeout);
 #ifdef __linux__
@@ -1061,6 +1338,15 @@ int main(void) {
     RUN(60, t_refused_across_attempts());
     RUN(60, t_enroll_expired());
     RUN(60, t_enroll_wrong_cert());
+    RUN(60, t_enroll_valid_accepted());
+    RUN(60, t_enroll_valid_refused());
+    RUN(60, t_enroll_valid_unreachable());
+    RUN(60, t_enroll_valid_tls_failure());
+    RUN(60, t_enroll_refused_shorter_replacement());
+    RUN(60, t_handshake_refused_shorter_replacement());
+    RUN(60, t_enroll_refused_other_client_stored());
+    RUN(60, t_enroll_probe_server_error());
+    RUN(60, t_enroll_lock_held());
 
     printf("\n%d checks, %d failed\n\n", g_run, g_fail);
     return g_fail ? 1 : 0;

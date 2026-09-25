@@ -341,7 +341,7 @@ int handshake_run_ex(const svx_config *cfg, handshake_result *out,
             /* Either the answer to our request or a renewal pushed at login.
              * Both ways the reflector ignores the rest of this session, so the
              * login ends here and the next one uses whatever is on disk. */
-            pki_push_result r = cert_handle_push(cfg, buf, (size_t)L, time(NULL));
+            pki_push_result r = cert_handle_push(cfg, buf, (size_t)L, time(NULL), rejected_fp);
             if (r == PKI_PUSH_STORED) {
                 out->cert_renewed = 1;
                 FAIL(out, "new certificate stored — reconnecting to use it");

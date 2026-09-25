@@ -39,9 +39,11 @@ void cert_assess(const svx_config *cfg, time_t now, cert_state *out, int log);
 
 /* Handle a MsgClientCert frame (`body` is the message after the length
  * prefix): validate the certificate and store it if it is good, logging the
- * outcome. Returns what happened. */
+ * outcome. `refused_fp` names a certificate the reflector has turned away (see
+ * pki_store_pushed_cert); NULL when there is none. Returns what happened. */
 pki_push_result cert_handle_push(const svx_config *cfg,
-                                 const uint8_t *body, size_t len, time_t now);
+                                 const uint8_t *body, size_t len, time_t now,
+                                 const char *refused_fp);
 
 /* The banner to show for a certificate in this state, with the exact thing
  * to do about it. Returns 1 and fills `out` when there is something to say,
